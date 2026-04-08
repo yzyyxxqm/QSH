@@ -45,4 +45,5 @@ for dataset_name in "P12" "MIMIC_III" "MIMIC_IV" "USHCN" "HumanActivity"; do
     # sh scripts/Transformer/$dataset_name.sh
     # sh scripts/TSMixer/$dataset_name.sh
     # sh scripts/Warpformer/$dataset_name.sh
+    # sh scripts/QSHNet/$dataset_name.sh
 done
