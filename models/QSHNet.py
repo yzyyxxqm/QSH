@@ -292,12 +292,16 @@ class HypergraphLearner(nn.Module):
         D = self.d_model
         L = temporal_incidence_matrix.shape[1]
 
-        # Causal temporal mask (only if enabled)
+        # Causal temporal mask: allow each temporal hyperedge at timestep t to
+        # aggregate from nodes at timesteps <= t (not just == t).
+        # This broadens the receptive field while maintaining causality.
+        # Without this, each temporal HE only sees nodes at its exact timestep.
         if self.use_causal_mask:
-            node_times = time_indices_flattened.unsqueeze(1).float()
+            node_times = time_indices_flattened.unsqueeze(1).float()  # (B, 1, N)
             he_times = torch.arange(L, device=node_times.device).view(1, L, 1).float()
-            causal_t_mask = (node_times <= he_times).float()
-            causal_t_inc = temporal_incidence_matrix * causal_t_mask
+            causal_t_inc = (node_times <= he_times).float()  # (B, L, N)
+            # Apply observation mask
+            causal_t_inc = causal_t_inc * repeat(x_y_mask_flattened, "B N -> B L N", L=L)
         else:
             causal_t_inc = temporal_incidence_matrix
 

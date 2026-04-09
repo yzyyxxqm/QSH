@@ -112,3 +112,16 @@ done
 
 echo ""
 echo "=== Ablation study complete ==="
+echo ""
+echo "Collecting results..."
+echo ""
+printf "%-20s %-15s %10s %10s\n" "Config" "Dataset" "MSE" "MAE"
+printf "%-20s %-15s %10s %10s\n" "------" "-------" "---" "---"
+for result_file in $(find storage/results -path "*/QSHNet/QSHNet*/eval_*/metrics.json" 2>/dev/null | sort); do
+    # Extract dataset and model_id from path
+    ds=$(echo "$result_file" | awk -F'/' '{print $3}')
+    mid=$(echo "$result_file" | awk -F'/' '{print $6}')
+    mse=$(python -c "import json; d=json.load(open('$result_file')); print(f'{d.get(\"MSE\",\"N/A\"):.6f}')" 2>/dev/null || echo "N/A")
+    mae=$(python -c "import json; d=json.load(open('$result_file')); print(f'{d.get(\"MAE\",\"N/A\"):.6f}')" 2>/dev/null || echo "N/A")
+    printf "%-20s %-15s %10s %10s\n" "$mid" "$ds" "$mse" "$mae"
+done
