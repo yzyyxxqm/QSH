@@ -1,30 +1,33 @@
 #!/bin/bash
 # QSH-Net Ablation Study
 #
-# 5 configurations:
+# Configurations:
 #   A: Full QSH-Net (all components ON)
 #   B: w/o Quaternion (noQB_noQH)
 #   C: w/o Spiking (noSP)
 #   D: w/o Causal Mask (noCM)
 #   E: Pure HyperIMTS replica (noQB_noQH_noSP_noCM)
+#   F: CausalMask only (noQB_noQH_noSP) — HyperIMTS + causal temporal masking
 #
 # Usage:
-#   bash scripts/QSHNet/ablation.sh           # run all 5 configs × 3 datasets
-#   bash scripts/QSHNet/ablation.sh E          # run only config E
-#   bash scripts/QSHNet/ablation.sh E USHCN    # run only config E on USHCN
+#   bash scripts/QSHNet/ablation.sh                 # all configs × 3 datasets, itr=1
+#   bash scripts/QSHNet/ablation.sh E               # only config E, itr=1
+#   bash scripts/QSHNet/ablation.sh E USHCN         # only config E on USHCN, itr=1
+#   bash scripts/QSHNet/ablation.sh E "" 5          # config E, all datasets, itr=5
+#   bash scripts/QSHNet/ablation.sh F "" 5          # config F, all datasets, itr=5
 
 . "$(dirname "$(readlink -f "$0")")/../globals.sh"
 
 model_name="QSHNet"
 FILTER_CONFIG="${1:-}"
 FILTER_DATASET="${2:-}"
+ITR="${3:-1}"
 
 run_one() {
     local ablation_name="$1"
     local model_id="$2"
     local dataset_name="$3"
 
-    # Skip if filter is set and doesn't match
     if [ -n "$FILTER_CONFIG" ] && [ "$FILTER_CONFIG" != "$ablation_name" ]; then return; fi
     if [ -n "$FILTER_DATASET" ] && [ "$FILTER_DATASET" != "$dataset_name" ]; then return; fi
 
@@ -55,7 +58,7 @@ run_one() {
 
     echo ""
     echo "============================================"
-    echo "  [$ablation_name] on $dataset_name"
+    echo "  [$ablation_name] on $dataset_name  (itr=$ITR)"
     echo "  model_id=$model_id"
     echo "============================================"
     python main.py \
@@ -79,49 +82,23 @@ run_one() {
         --train_epochs 300 \
         --patience 10 \
         --val_interval 1 \
-        --itr 1 \
+        --itr $ITR \
         --batch_size $batch_size \
         --learning_rate 1e-3 \
         $extra_args
 }
 
-# Config A: Full QSH-Net
 for ds in USHCN HumanActivity P12; do
     run_one "A" "QSHNet" "$ds"
-done
-
-# Config B: w/o Quaternion
-for ds in USHCN HumanActivity P12; do
     run_one "B" "QSHNet_noQB_noQH" "$ds"
-done
-
-# Config C: w/o Spiking
-for ds in USHCN HumanActivity P12; do
     run_one "C" "QSHNet_noSP" "$ds"
-done
-
-# Config D: w/o Causal Mask
-for ds in USHCN HumanActivity P12; do
     run_one "D" "QSHNet_noCM" "$ds"
+    run_one "E" "QSHNet_noQB_noQH_noSP_noCM_noQV_noST" "$ds"
+    run_one "F" "QSHNet_noQB_noQH_noSP_noQV_noST" "$ds"
+    run_one "G" "QSHNet_noQB_noQH_noSP" "$ds"
+    run_one "H" "QSHNet_noQB_noQH_noSP_noST" "$ds"
+    run_one "I" "QSHNet_noQB_noQH_noSP_noQV" "$ds"
 done
 
-# Config E: Pure HyperIMTS replica
-for ds in USHCN HumanActivity P12; do
-    run_one "E" "QSHNet_noQB_noQH_noSP_noCM" "$ds"
-done
-
 echo ""
-echo "=== Ablation study complete ==="
-echo ""
-echo "Collecting results..."
-echo ""
-printf "%-20s %-15s %10s %10s\n" "Config" "Dataset" "MSE" "MAE"
-printf "%-20s %-15s %10s %10s\n" "------" "-------" "---" "---"
-for result_file in $(find storage/results -path "*/QSHNet/QSHNet*/eval_*/metrics.json" 2>/dev/null | sort); do
-    # Extract dataset and model_id from path
-    ds=$(echo "$result_file" | awk -F'/' '{print $3}')
-    mid=$(echo "$result_file" | awk -F'/' '{print $6}')
-    mse=$(python -c "import json; d=json.load(open('$result_file')); print(f'{d.get(\"MSE\",\"N/A\"):.6f}')" 2>/dev/null || echo "N/A")
-    mae=$(python -c "import json; d=json.load(open('$result_file')); print(f'{d.get(\"MAE\",\"N/A\"):.6f}')" 2>/dev/null || echo "N/A")
-    printf "%-20s %-15s %10s %10s\n" "$mid" "$ds" "$mse" "$mae"
-done
+echo "=== Complete ==="

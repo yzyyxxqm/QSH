@@ -190,14 +190,22 @@ class IrregularityAwareAttention(nn.Module):
 # ============================================================================
 
 class HypergraphEncoder(nn.Module):
-    def __init__(self, enc_in, time_length, d_model):
+    def __init__(self, enc_in, time_length, d_model, use_spiking_temporal=True):
         super().__init__()
         self.enc_in = enc_in
         self.d_model = d_model
+        self.use_spiking_temporal = use_spiking_temporal
         self.variable_hyperedge_weights = nn.Parameter(torch.randn(enc_in, d_model), requires_grad=True)
         self.relu = nn.ReLU()
         self.observation_node_encoder = nn.Linear(2, d_model)
         self.temporal_hyperedge_encoder = nn.Linear(1, d_model)
+        
+        # Step 4: Spiking-gated temporal hyperedge initialization
+        # Spike threshold determines which timesteps are "event-worthy"
+        if use_spiking_temporal:
+            self.temporal_membrane = nn.Linear(d_model, d_model)
+            self.temporal_spike_threshold = nn.Parameter(torch.tensor(0.3))
+            self.temporal_spike_gamma = nn.Parameter(torch.tensor(5.0))
 
     def forward(self, x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
                 x_y_mark, variable_indices_flattened, time_indices_flattened, N_OBSERVATIONS_MAX):
@@ -223,6 +231,15 @@ class HypergraphEncoder(nn.Module):
         observation_nodes = self.relu(self.observation_node_encoder(x_L_flattened)) * repeat(
             x_y_mask_flattened, "B N -> B N D", D=D)
         temporal_hyperedges = torch.sin(self.temporal_hyperedge_encoder(x_y_mark))
+        
+        # Step 4: Spike-gated temporal HEs — learn which timesteps are "event-worthy"
+        if self.use_spiking_temporal:
+            t_membrane = self.temporal_membrane(temporal_hyperedges)
+            t_spike = SpikeFunction.apply(
+                t_membrane, self.temporal_spike_threshold,
+                self.temporal_spike_gamma.abs() + 0.1)
+            temporal_hyperedges = temporal_hyperedges * (1.0 + t_spike)
+        
         variable_hyperedges = self.relu(repeat(
             self.variable_hyperedge_weights, "E D -> B E D", B=B))
 
@@ -236,7 +253,8 @@ class HypergraphEncoder(nn.Module):
 
 class HypergraphLearner(nn.Module):
     def __init__(self, n_layers, d_model, n_heads, time_length,
-                 use_quaternion_h2n=True, use_spiking=True, use_causal_mask=True):
+                 use_quaternion_h2n=True, use_spiking=True, use_causal_mask=True,
+                 use_quaternion_var_he=True):
         super().__init__()
         self.n_layers = n_layers
         self.d_model = d_model
@@ -244,6 +262,7 @@ class HypergraphLearner(nn.Module):
         self.use_quaternion_h2n = use_quaternion_h2n
         self.use_spiking = use_spiking
         self.use_causal_mask = use_causal_mask
+        self.use_quaternion_var_he = use_quaternion_var_he
 
         # Identical to HyperIMTS: node→hyperedge attention
         self.node2temporal_hyperedge = nn.ModuleList([
@@ -268,6 +287,12 @@ class HypergraphLearner(nn.Module):
         self.hyperedge2hyperedge_layers = [n_layers - 1]
         self.scale = 1 / time_length
         self.oom_flag = False
+
+        # Step 3: Quaternion transform on variable HE-to-HE output
+        # Variable hyperedges represent cross-variable relationships — quaternion's
+        # inter-component coupling captures multi-dimensional variable interactions
+        if use_quaternion_var_he:
+            self.var_he_quat = QuaternionLinear(d_model, d_model)
 
         # Spiking gate (only created if enabled)
         if use_spiking:
@@ -362,8 +387,12 @@ class HypergraphLearner(nn.Module):
                 mc = sync_mask.transpose(-1, -2) @ sync_mask
                 nopv = mc.diagonal(0, -2, -1)
                 mc[nopv != 0] = (mc / repeat(nopv, "B E -> B E E2", E2=sync_mask.shape[-1]))[nopv != 0]
-                variable_hyperedges = variable_hyperedges + self.variable_hyperedge2variable_hyperedge(
+                var_he_update = self.variable_hyperedge2variable_hyperedge(
                     x=variable_hyperedges, query_aux=qk, key_aux=qk, merge_coefficients=mc)
+                # Step 3: Quaternion transform on variable HE interactions
+                if self.use_quaternion_var_he:
+                    var_he_update = self.var_he_quat(var_he_update)
+                variable_hyperedges = variable_hyperedges + var_he_update
 
         return observation_nodes, temporal_hyperedges, variable_hyperedges
 
@@ -402,14 +431,18 @@ class Model(nn.Module):
         use_quaternion_h2n = "noQH" not in mid
         use_spiking = "noSP" not in mid
         use_causal_mask = "noCM" not in mid
+        use_quaternion_var_he = "noQV" not in mid
+        use_spiking_temporal = "noST" not in mid
 
         # HyperIMTS core
-        self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D)
+        self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D,
+            use_spiking_temporal=use_spiking_temporal)
         self.hypergraph_learner = HypergraphLearner(
             configs.n_layers, D, configs.n_heads, tl,
             use_quaternion_h2n=use_quaternion_h2n,
             use_spiking=use_spiking,
-            use_causal_mask=use_causal_mask)
+            use_causal_mask=use_causal_mask,
+            use_quaternion_var_he=use_quaternion_var_he)
         self.hypergraph_decoder = nn.Linear(3 * D, 1)
 
         # QSH-Net: QuaternionBlock (only if enabled)
