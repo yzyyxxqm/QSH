@@ -189,6 +189,8 @@ class HypergraphEncoder(nn.Module):
         self.relu = nn.ReLU()
         self.observation_node_encoder = nn.Linear(2, d_model)
         self.temporal_hyperedge_encoder = nn.Linear(1, d_model)
+        # Δt-aware: encode observation density per timestep
+        self.density_encoder = nn.Linear(1, d_model)
 
     def forward(self, x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
                 x_y_mark, variable_indices_flattened, time_indices_flattened, N_OBSERVATIONS_MAX):
@@ -214,6 +216,10 @@ class HypergraphEncoder(nn.Module):
         observation_nodes = self.relu(self.observation_node_encoder(x_L_flattened)) * repeat(
             x_y_mask_flattened, "B N -> B N D", D=D)
         temporal_hyperedges = torch.sin(self.temporal_hyperedge_encoder(x_y_mark))
+        # Density encoding: how many observations at each timestep
+        # density = row sum of temporal incidence matrix → (B, L)
+        density = temporal_incidence_matrix.sum(dim=-1, keepdim=True)  # (B, L, 1)
+        temporal_hyperedges = temporal_hyperedges + self.density_encoder(density)
         variable_hyperedges = self.relu(repeat(self.variable_hyperedge_weights, "E D -> B E D", B=B))
 
         return (observation_nodes, temporal_hyperedges, variable_hyperedges,
@@ -259,6 +265,13 @@ class HypergraphLearner(nn.Module):
         # Gate α: initialized near 0 so model starts as pure HyperIMTS
         self.quat_gate = nn.ParameterList([
             nn.Parameter(torch.tensor(-2.0)) for _ in range(n_layers)])  # sigmoid(-2)≈0.12
+
+        # === QSH-Net Enhancement 3: Temporal HE causal communication ===
+        # Causal depthwise conv lets adjacent temporal HEs share information
+        # kernel_size=5: each temporal HE sees 4 past HEs
+        self.temporal_he_conv = nn.ModuleList([
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=4, groups=d_model)
+            for _ in range(n_layers)])
 
     def get_fine_grained_embedding(self, tensor_flattened, target_shape):
         """Identical to HyperIMTS."""
@@ -307,6 +320,13 @@ class HypergraphLearner(nn.Module):
 
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated
+
+            # === Enhancement 3: Temporal HE causal communication ===
+            # Let adjacent temporal hyperedges share information (local time trends)
+            L_t = temporal_hyperedges.shape[1]
+            t_conv = self.temporal_he_conv[i](
+                temporal_hyperedges.transpose(1, 2))[:, :, :L_t].transpose(1, 2)
+            temporal_hyperedges = temporal_hyperedges + t_conv
 
             # Hyperedge→node
             tg = temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D))
