@@ -36,54 +36,60 @@ class QuaternionStructuredFusion(nn.Module):
     """
     Fuses obs (node), tg (temporal HE), vg (variable HE) via Hamilton product.
 
-    Each source is projected to D/4 dimensions to form a quaternion:
-      r = Linear(3D, D/4)(cat(obs, tg, vg))  — real: original linear fusion
-      i = Linear(D, D/4)(obs)                 — imag-i: node self
-      j = Linear(D, D/4)(tg)                  — imag-j: temporal context
-      k = Linear(D, D/4)(vg)                  — imag-k: variable context
+    Each source is projected to full D dimensions to form a quaternion:
+      r = Linear(3D, D)(cat(obs, tg, vg))  — real: original linear fusion
+      i = Linear(D, D)(obs)                 — imag-i: node self
+      j = Linear(D, D)(tg)                  — imag-j: temporal context
+      k = Linear(D, D)(vg)                  — imag-k: variable context
 
-    Concatenated as q = cat(r, i, j, k) ∈ R^D, then Hamilton product via
-    Kronecker block matrix W ∈ R^(D×D):
+    Concatenated as q = cat(r, i, j, k) ∈ R^(4D), then Hamilton product via
+    Kronecker block matrix W ∈ R^(4D × 4D):
 
         ┌ Wr  -Wi  -Wj  -Wk ┐   ┌ r ┐
-    W = │ Wi   Wr  -Wk   Wj │ × │ i │    where Wr,Wi,Wj,Wk ∈ R^(D/4 × D/4)
+    W = │ Wi   Wr  -Wk   Wj │ × │ i │    where Wr,Wi,Wj,Wk ∈ R^(D × D)
         │ Wj   Wk   Wr  -Wi │   │ j │
         └ Wk  -Wj   Wi   Wr ┘   └ k ┘
 
     Cross-source interactions emerge from off-diagonal blocks:
-      - Wi*r + Wr*i + Wk*j - Wj*k  →  node interacts with time (Wk*j) and var (-Wj*k)
-      - Wj*r - Wk*i + Wr*j + Wi*k  →  time interacts with var (Wi*k) and node (-Wk*i)
-      - Wk*r + Wj*i - Wi*j + Wr*k  →  var interacts with node (Wj*i) and time (-Wi*j)
+      - Wi*r + Wr*i + Wk*j - Wj*k  →  node interacts with time and variable
+      - Wj*r - Wk*i + Wr*j + Wi*k  →  time interacts with variable and node
+      - Wk*r + Wj*i - Wi*j + Wr*k  →  variable interacts with node and time
 
-    Identity init: Wr=I, Wi=Wj=Wk=0, all projections identity-initialized.
-    At init: output = cat(r, i, j, k) with identity Hamilton = cat(r, i, j, k),
-    and since proj_r maps 3D→D/4 (the dominant path), this approximates the
-    original Linear(3D, D) behavior.
+    Output is projected back to D via Linear(4D, D).
+
+    Identity init: Wr=I, Wi=Wj=Wk=0, proj_i/j/k=I, out_proj maps
+    cat(r,i,j,k) → r (first D dims). At init this equals Linear(3D,D)(cat(obs,tg,vg)).
     """
     def __init__(self, d_model):
         super().__init__()
-        assert d_model % 4 == 0
         self.d_model = d_model
-        q = d_model // 4
+        D = d_model
 
-        # Projections to quaternion components (each D → D/4)
-        self.proj_r = nn.Linear(3 * d_model, q)  # real: fuses all three sources
-        self.proj_i = nn.Linear(d_model, q)       # imag-i: node
-        self.proj_j = nn.Linear(d_model, q)       # imag-j: temporal
-        self.proj_k = nn.Linear(d_model, q)       # imag-k: variable
+        # Projections: each source → full D-dim quaternion component
+        self.proj_r = nn.Linear(3 * D, D)   # real: fuses all three sources
+        self.proj_i = nn.Linear(D, D, bias=False)  # imag-i: node
+        self.proj_j = nn.Linear(D, D, bias=False)  # imag-j: temporal
+        self.proj_k = nn.Linear(D, D, bias=False)  # imag-k: variable
+        nn.init.eye_(self.proj_i.weight)
+        nn.init.eye_(self.proj_j.weight)
+        nn.init.eye_(self.proj_k.weight)
 
-        # Hamilton product weights (Kronecker block sub-matrices)
-        self.Wr = nn.Parameter(torch.empty(q, q))
-        self.Wi = nn.Parameter(torch.empty(q, q))
-        self.Wj = nn.Parameter(torch.empty(q, q))
-        self.Wk = nn.Parameter(torch.empty(q, q))
-        self.bias = nn.Parameter(torch.zeros(d_model))
-
-        # Identity init
+        # Hamilton product weights: Kronecker block sub-matrices, each (D × D)
+        self.Wr = nn.Parameter(torch.empty(D, D))
+        self.Wi = nn.Parameter(torch.empty(D, D))
+        self.Wj = nn.Parameter(torch.empty(D, D))
+        self.Wk = nn.Parameter(torch.empty(D, D))
         nn.init.eye_(self.Wr)
         nn.init.zeros_(self.Wi)
         nn.init.zeros_(self.Wj)
         nn.init.zeros_(self.Wk)
+
+        # Output projection: 4D → D
+        self.out_proj = nn.Linear(4 * D, D)
+        # Identity init: select the real part (first D dims) at start
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        self.out_proj.weight.data[:, :D] = torch.eye(D)
 
     def forward(self, obs, tg, vg):
         """
@@ -92,25 +98,28 @@ class QuaternionStructuredFusion(nn.Module):
         vg:  (B, N, D) gathered variable hyperedge features
         Returns: (B, N, D) fused output
         """
-        # Project to quaternion components, each (B, N, D/4)
-        r = self.proj_r(torch.cat([obs, tg, vg], dim=-1))
-        i = self.proj_i(obs)
-        j = self.proj_j(tg)
-        k = self.proj_k(vg)
+        # Project to full D-dim quaternion components
+        r = self.proj_r(torch.cat([obs, tg, vg], dim=-1))  # (B, N, D)
+        i = self.proj_i(obs)   # (B, N, D)
+        j = self.proj_j(tg)   # (B, N, D)
+        k = self.proj_k(vg)   # (B, N, D)
 
-        # Concatenate into D-dim quaternion vector
-        q_in = torch.cat([r, i, j, k], dim=-1)  # (B, N, D)
+        # Concatenate into 4D-dim quaternion vector
+        q_in = torch.cat([r, i, j, k], dim=-1)  # (B, N, 4D)
 
-        # Build Kronecker block matrix and apply Hamilton product
+        # Build Kronecker block matrix W ∈ R^(4D × 4D) and apply Hamilton product
         Wr, Wi, Wj, Wk = self.Wr, self.Wi, self.Wj, self.Wk
         W = torch.cat([
             torch.cat([ Wr, -Wi, -Wj, -Wk], dim=1),
             torch.cat([ Wi,  Wr, -Wk,  Wj], dim=1),
             torch.cat([ Wj,  Wk,  Wr, -Wi], dim=1),
             torch.cat([ Wk, -Wj,  Wi,  Wr], dim=1),
-        ], dim=0)  # (D, D)
+        ], dim=0)  # (4D, 4D)
 
-        return F.linear(q_in, W, self.bias)  # (B, N, D)
+        q_out = F.linear(q_in, W)  # (B, N, 4D)
+
+        # Project back to D dimensions
+        return self.out_proj(q_out)  # (B, N, D)
 
 
 # ============================================================================
