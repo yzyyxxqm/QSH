@@ -34,38 +34,34 @@ from utils.globals import logger
 
 class QuaternionStructuredFusion(nn.Module):
     """
-    Fuses obs (node), tg (temporal HE), vg (variable HE) via Hamilton product.
+    Fuses obs, tg, vg via original Linear(3D, D) PLUS a Hamilton product
+    residual that captures structured cross-source interactions.
 
-    Each source is projected to full D dimensions:
-      r = Linear(3D, D)(cat(obs, tg, vg))  — real: original linear fusion
-      i = Linear(D, D)(obs)                 — imag-i: node self
-      j = Linear(D, D)(tg)                  — imag-j: temporal context
-      k = Linear(D, D)(vg)                  — imag-k: variable context
+    Main path (identical to HyperIMTS):
+      linear_out = Linear(3D, D)(cat(obs, tg, vg))
 
-    Then each D-dim component is split into 4 groups of D/4. Within each group
-    position g, the 4 scalars (r_g, i_g, j_g, k_g) form a quaternion, and the
-    Hamilton product mixes them via Kronecker block matrix W ∈ R^(D × D):
+    Residual path (quaternion cross-source interactions):
+      r = linear_out                        — real: main path output
+      i = Linear(D, D)(obs)                 — node self
+      j = Linear(D, D)(tg)                  — temporal context
+      k = Linear(D, D)(vg)                  — variable context
+      q_out = HamiltonProduct(cat(r,i,j,k)) — (4D×4D) Kronecker block matrix
+      residual = q_out[..., :D]             — take real part
 
-        ┌ Wr  -Wi  -Wj  -Wk ┐
-    W = │ Wi   Wr  -Wk   Wj │    where Wr,Wi,Wj,Wk ∈ R^(D/4 × D/4)
-        │ Wj   Wk   Wr  -Wi │
-        └ Wk  -Wj   Wi   Wr ┘
+    Output = linear_out + α * residual
 
-    Input is cat(r, i, j, k) ∈ R^(4D), reshaped to interleave groups, then
-    multiplied by W to produce D-dim output directly. No out_proj needed.
-
-    But to keep it simple and correct: we interleave the 4 components into
-    quaternion order [r0,i0,j0,k0, r1,i1,j1,k1, ...] so the standard
-    Kronecker block matrix applies directly.
-
-    Identity init: Wr=I, Wi=Wj=Wk=0, proj_i/j/k=I → output = r = Linear(3D,D).
+    Identity init: Wr=I, Wi=Wj=Wk=0, proj_i/j/k=I, α=0
+    → residual = linear_out, output = linear_out + 0*linear_out = linear_out
+    → EXACT HyperIMTS at initialization.
     """
     def __init__(self, d_model):
         super().__init__()
         self.d_model = d_model
 
-        # Projections: each source → full D-dim
-        self.proj_r = nn.Linear(3 * d_model, d_model)
+        # Main path: identical to HyperIMTS
+        self.linear = nn.Linear(3 * d_model, d_model)
+
+        # Quaternion residual projections
         self.proj_i = nn.Linear(d_model, d_model, bias=False)
         self.proj_j = nn.Linear(d_model, d_model, bias=False)
         self.proj_k = nn.Linear(d_model, d_model, bias=False)
@@ -73,33 +69,30 @@ class QuaternionStructuredFusion(nn.Module):
         nn.init.eye_(self.proj_j.weight)
         nn.init.eye_(self.proj_k.weight)
 
-        # Hamilton product weights: Kronecker block sub-matrices, each (D × D)
+        # Hamilton product weights (D × D sub-matrices)
         self.Wr = nn.Parameter(torch.empty(d_model, d_model))
         self.Wi = nn.Parameter(torch.empty(d_model, d_model))
         self.Wj = nn.Parameter(torch.empty(d_model, d_model))
         self.Wk = nn.Parameter(torch.empty(d_model, d_model))
-        self.bias = nn.Parameter(torch.zeros(d_model))
         nn.init.eye_(self.Wr)
         nn.init.zeros_(self.Wi)
         nn.init.zeros_(self.Wj)
         nn.init.zeros_(self.Wk)
 
+        # Gate: starts at 0 → pure HyperIMTS, learns to incorporate quaternion
+        self.gate = nn.Parameter(torch.tensor(0.0))
+
     def forward(self, obs, tg, vg):
-        """
-        obs: (B, N, D) node features
-        tg:  (B, N, D) gathered temporal hyperedge features
-        vg:  (B, N, D) gathered variable hyperedge features
-        Returns: (B, N, D) fused output
-        """
         D = self.d_model
-        # Project to full D-dim quaternion components
-        r = self.proj_r(torch.cat([obs, tg, vg], dim=-1))  # (B, N, D)
+        # Main path (HyperIMTS original)
+        linear_out = self.linear(torch.cat([obs, tg, vg], dim=-1))  # (B, N, D)
+
+        # Quaternion residual: structured cross-source interactions
+        r = linear_out
         i = self.proj_i(obs)
         j = self.proj_j(tg)
         k = self.proj_k(vg)
 
-        # Hamilton product via (4D × 4D) Kronecker block matrix
-        # Input: cat(r, i, j, k) ∈ R^(4D)
         q_in = torch.cat([r, i, j, k], dim=-1)  # (B, N, 4D)
 
         Wr, Wi, Wj, Wk = self.Wr, self.Wi, self.Wj, self.Wk
@@ -111,9 +104,11 @@ class QuaternionStructuredFusion(nn.Module):
         ], dim=0)  # (4D, 4D)
 
         q_out = F.linear(q_in, W)  # (B, N, 4D)
+        residual = q_out[..., :D]  # real part
 
-        # Extract real part (first D dims) as output
-        return q_out[..., :D] + self.bias
+        # Additive residual with learnable gate
+        alpha = torch.tanh(self.gate)  # ∈ (-1, 1), starts at 0
+        return linear_out + alpha * residual
 
 
 # ============================================================================
