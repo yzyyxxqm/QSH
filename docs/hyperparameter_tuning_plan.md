@@ -1,6 +1,6 @@
 # QSH-Net 超参数与诊断计划
 
-> **最后更新：** 2026-04-18
+> **最后更新：** 2026-04-19
 
 ## 当前状态
 
@@ -12,7 +12,27 @@
 2. 旧 M1 更接近 `HyperIMTS + retain 调制 + quaternion 残差`。
 3. 如果希望保住论文里的「三元素统一框架」，必须先让 `event` 分支变成真实可训练、真实参与训练的分支，而不是继续把它当成挂名模块。
 
-## 当前主线候选结果（2026-04-16）
+同时，`eventdensvar_main` 的服务器四数据集正式验证已经完成，当前需要以该结果为准，而不能再只依据本地 `USHCN itr=5` 的筛选结果做判断。
+
+2026-04-19 之后又补做了三类单因素稳定化试验：
+
+- `routebound075`: 单纯压 `route_logit`，失败；
+- `eventprojgrad2`: 单纯加速 `event_proj` 学习，失败；
+- `routeconfvar`: route dispersion 感知的 variable event 衰减，失败。
+- `memgradclip012`: 单纯裁剪 `membrane_proj` 梯度，失败。
+- `routecenter`: route logit 样本内均值中心化，失败。
+- `eventgateconst_quat020`: 单纯压 quaternion residual cap，不是根因级修复，失败后回退。
+- `eventgateconst_meminit001`: 主动提高 `membrane` 初始 route dispersion，明显失败后回退。
+- `eventgateconst_routedetach`: 切断 route density 对稳定化支路的反向梯度，失败后回退。
+
+因此后续不应继续把问题简化为“某个 gate 太大/太小”“event projection 学得不够快”“membrane 梯度尖峰需要直接裁剪”或“route mean 漂移需要中心化”。
+同样也不应再默认尝试：
+
+- 修改 `membrane` 初始化来人为制造早期 route dispersion
+- 把 route density 从稳定化训练反馈里硬切出去
+- 继续压单纯 quaternion residual cap
+
+## 当前主线候选结果（更新到 2026-04-18）
 
 | 版本 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
 |------|--------|------|----------------|------|
@@ -38,6 +58,30 @@
 | `eventdenscap_main` | USHCN | 5 | **0.1891 ± 0.0347** | 全路径 density 抑制明显更差，方向否决 |
 | `eventdensvar_main` | HumanActivity | 3 | **0.04181 ± 0.00011** | 保持 HumanActivity 改善 |
 | `eventdensvar_main` | USHCN | 5 | **0.1703 ± 0.0058** | 略弱于主线，但方差收敛明显，当前可接受保留候选 |
+| `eventdensvar_main` | HumanActivity | 5 | **0.04174 ± 0.00019** | 服务器验证确认改善稳定可复现 |
+| `eventdensvar_main` | USHCN | 10 | **0.1886 ± 0.0324** | 服务器验证显示坏轮仍明显，不能升级为统一主线 |
+| `eventdensvar_main` | P12 | 5 | **0.30092 ± 0.00062** | 服务器验证稳定，通过跨数据集可用性检查 |
+| `eventdensvar_main` | MIMIC_III | 5 | **0.39791 ± 0.01530** | 均值可接受，但仍有单轮失稳 |
+| `variable residual only + adaptive fused-cap` | USHCN | 5 | **0.16785 ± 0.00772** | 当前代码主线，用户已接受 |
+| `variable residual only + adaptive fused-cap` | USHCN | 10 | **0.19035 ± 0.03078** | 诊断运行显示后段坏轮仍存在 |
+| `routebound075` | USHCN | 10 | **0.18132 ± 0.02602** | 单纯压 route logit 失败 |
+| `eventprojgrad2` | USHCN | 10 | **0.18962 ± 0.03279** | 加速 event projection 学习失败 |
+| `routeconfvar` | USHCN | 10 | **0.19155 ± 0.03720** | route dispersion 感知 event 衰减失败 |
+| `memgradclip012` | USHCN | 10 | **0.17775 ± 0.02485** | 均值尚可，但坏轮上界仍高，已撤回 |
+| `routecenter` | USHCN | 10 | **0.18433 ± 0.03669** | route 均值中心化失败，已撤回 |
+| `eventgateconst` | USHCN | 10 | **0.17587 ± 0.01571** | 当前唯一值得保留的尾部压制候选 |
+| `eventgateconst_quat020` | USHCN | 10 | **0.17550 ± 0.01473** | 数值略优，但 `quat_clip=0.0`，不是根因级改动，已撤回 |
+| `eventgateconst_meminit001` | USHCN | 10 | **0.21388 ± 0.08635** | 主动提高 route 初始分散度明显失败 |
+| `eventgateconst_routedetach` | USHCN | 10 | **0.18122 ± 0.02408** | 切断 route density 反向梯度失败 |
+
+## 当前正式结论
+
+在服务器四数据集验证之后，当前最准确的结论应当是：
+
+1. `eventscalecap_main / eventscalecap_itr10` 仍然是统一主线母体。
+2. `eventdensvar_main` 仍值得保留，但只能作为 `event density` 方向的工作区候选，不能升级为新的统一主线。
+3. `HumanActivity` 与 `P12` 已经通过，`MIMIC_III` 基本可接受但仍有坏轮。
+4. 当前真正没有过关的数据集是 `USHCN`，因此后续优化目标必须聚焦到坏轮压制，而不是继续泛泛地“调参”。
 
 ## 当前训练配置
 
@@ -174,6 +218,13 @@
    - 但相比 `eventrescap_main` / `eventdenscap_main`，它已经显著收敛，且没有再出现严重长尾。
    - 当前更准确的定位是：它不是新的统一主线，但已经是可接受保留候选。
 
+12. **服务器四数据集验证进一步收紧了 `eventdensvar_main` 的定位。**
+   - `HumanActivity itr=5` 为 `0.04174 ± 0.00019`，改善稳定复现。
+   - `P12 itr=5` 为 `0.30092 ± 0.00062`，结果稳定。
+   - `MIMIC_III itr=5` 为 `0.39791 ± 0.01530`，均值可接受但仍有单轮失稳。
+   - `USHCN itr=10` 退化到 `0.1886 ± 0.0324`，并重新出现明显坏轮。
+   - 因此它只能保留为工作区候选，不能替代 `eventscalecap_main / eventscalecap_itr10`。
+
 ## 当前工作判断
 
 ### 现在不应该优先做的事
@@ -190,13 +241,57 @@
 2. **如果目标是保住论文里的三元素统一框架，当前更合适的主线候选已经升级为 `eventnorm + mild event_scale cap`。**
 3. **`eventdensvar_main` 可以作为当前可接受保留候选，但还不应替代统一母体。**
 4. **`eventscalecap_itr10` 仍然保留尾部坏轮，当前更适合写成“可训练、可控、已明显改善但尚未彻底稳定”的阶段性结论。**
+5. **服务器正式验证之后，下一步不该再追求继续改善 `HumanActivity`，而应只盯 `USHCN` 坏轮压制，同时守住 `P12 / MIMIC_III`。**
+6. **最新失败试验说明，不应继续做单点 gate bound、单点梯度倍率、单点梯度裁剪、route 均值中心化或 route dispersion 触发的局部 event 衰减。**
+7. **当前唯一相对收敛的新判断是：`event_gate` 不应继续直接依赖 `route_logit`。**
+8. **但 route 本身也不能被粗暴改初始化或切断反馈；这两条已被新增试验证伪。**
+
+## 2026-04-19 之后的最新收敛判断
+
+### 已知最有价值的新增结论
+
+1. `eventgateconst` 有效
+- 它把坏轮尾部从此前一批失败近邻实验的 `0.23~0.27` 区间，压回到 `0.21558`
+- 但仍没有达到 `<=0.18` 的目标
+
+2. `quat020` 不是根因修复
+- 虽然数值略有改善
+- 但 `quat_clip=0.0`
+- 说明“压输出 residual 比例”没有真正进入主矛盾
+
+3. `meminit001` 明确证伪
+- 提前制造 route dispersion 会把系统直接推向更差的高方差状态
+
+4. `routedetach` 明确证伪
+- route density 虽然与坏轮相关，但其训练反馈不能被简单切断
+
+### 因此，下一步不应再做什么
+
+- 不继续试 `membrane_proj` 初始化技巧
+- 不继续试 route density detach
+- 不继续试简单 quaternion residual cap
+- 不回到常规大规模学习率 / batch size 扫描
+
+### 下一步真正值得保留的问题
+
+在当前证据下，后续结构试验应围绕：
+
+- `eventgateconst` 这个候选框架继续做
+- 重点看 quaternion 参数演化方式本身
+- 而不是继续碰 route 前端或全局收缩开关
 
 ### 下一步建议
 
 1. 继续以 `eventscalecap_main` / `eventscalecap_itr10` 作为当前统一框架候选版本。
-2. 把 `eventdensvar_main` 记为当前可接受保留候选，用于后续 density-aware 方向的直接起点。
+2. 把 `variable residual only + adaptive fused-cap` 记为当前代码主线，用于后续 USHCN 坏轮压制的直接起点。
+3. 把 `eventdensvar_main` 记为历史可接受保留候选，而不是继续默认升级它。
 3. 暂不继续做大规模超参数扫描。
-4. 后续结构试验若继续推进，优先围绕 variable 路径的更细粒度尾部控制做单因素消融，而不是回到全路径收缩。
+4. 后续结构试验若继续推进，只围绕 `USHCN` 坏轮压制做单因素消融，而不是回到全路径收缩。
+5. 新试验必须同时检查：
+   - `USHCN itr>=5`，更稳妥是 `itr=10`
+   - `HumanActivity itr=3`
+   - 通过后再看 `P12 / MIMIC_III`
+6. 当前不再把学习率、batch size、层数扫描视为主优先级；除非出现新的明确证据，否则默认问题首先是结构问题，不是常规超参数问题。
 
 ## 运行与诊断方式
 
@@ -243,6 +338,7 @@ python main.py --is_training 1 --collate_fn collate_fn --loss MSE \
 - HumanActivity 用 `itr = 3` 即可做快速对照
 - 在已经确认 `event` 可以被唤醒之后，重点应转向“如何让它长期稳定”，而不是重新回到常规调参
 - `event density` 方向已经形成新约束：若继续推进，只看 variable 路径，不再同时动 temporal 路径
+- 服务器正式验证之后，`eventdensvar_main` 的身份应固定为“保留候选”，而不是“待升级新主线”
 
 ## EQHO 开发阶段补充（2026-04-17）
 
@@ -427,3 +523,59 @@ python main.py --is_training 1 --collate_fn collate_fn --loss MSE \
 
 - 暂时冻结 `EQHO` 在 `A2.6`
 - 若要继续改，应重新提出更上层的结构假设，而不是继续在 summarizer 层修补
+
+## 2026-04-19：传播选择版 spike 的最新约束
+
+为兼顾论文叙事，曾尝试把 spike 从「event 幅值控制器」改成「传播选择器」：
+
+- 新增 `selection_weight = sigmoid(route_logit)`；
+- 将 `obs_base` 改为 `obs_selected = obs_base * selection_weight`；
+- 用 `obs_selected` 进入 temporal / variable node-to-hyperedge 传播；
+- 其余 `eventgateconst`、event residual、fused-cap、quaternion 均保持不变。
+
+本地 `USHCN itr=10` 结果：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | max | 结论 |
+|------|--------|------|----------------|-----|------|
+| `spikeselectprop_a1` | USHCN | 10 | `0.19942 ± 0.02713` | `0.26434` | 明显退化，失败 |
+
+由此更新后续约束：
+
+1. 不再把「传播选择」实现为直接缩放 observation message。
+2. 不把 `selection_weight` 版 n2h 输入缩放作为论文主线。
+3. 当前代码中的 `selection_mean / selection_std` 可保留为诊断字段，但不能据此认定传播选择结构有效。
+4. 如果后续继续做 spike 叙事友好的结构，应优先考虑：
+   - attention-level bias；
+   - residual-style propagation selection；
+   - 或只作为解释性 route diagnostic，而不是直接改变主传播输入。
+5. 工程稳定主线仍应回到 `eventgateconst`，不要继续沿 `spikeselectprop_a1` 做参数微调。
+
+### 后续修正：identity-preserving residual selection
+
+`spikeselectprop_a1` 失败后，进一步确认其核心问题是破坏 identity initialization：
+
+- 初始 `route_logit = 0`
+- `selection_weight = sigmoid(0) = 0.5`
+- 直接乘到 n2h observation message 上会把主传播输入缩小为 50%
+
+因此改成：
+
+```text
+selection_factor = 1 + strength * (selection_weight - 0.5)
+obs_selected = obs_base * selection_factor
+```
+
+这样初始化时 `selection_factor = 1.0`，不会破坏主干。
+
+| 配置 | 数据集 | 轮数 | strength | MSE 均值 ± std | max | 结论 |
+|------|--------|------|----------|----------------|-----|------|
+| `spikeselectprop_res010` | USHCN | 10 | `0.10` | `0.17535 ± 0.02540` | `0.24952` | 均值可接受，但仍有重坏轮 |
+| `spikeselectprop_res005` | USHCN | 10 | `0.05` | `0.16988 ± 0.00937` | `0.19176` | 当前最优候选 |
+| `spikeselectprop_res005` | HumanActivity | 5 | `0.05` | `0.04175 ± 0.00018` | `0.04202` | 稳定，不伤简单数据 |
+
+新的约束：
+
+1. 如果继续做 propagation selection，只允许 identity-preserving residual 形式。
+2. 当前保留 `strength = 0.05`，不要继续放大到 `0.10`。
+3. `HumanActivity` 已确认稳定，不伤简单数据。
+4. 下一步安排服务器覆盖 `P12 / MIMIC_III`，暂不跑 `MIMIC_IV`。

@@ -7,14 +7,24 @@
 
 当前推荐放到服务器上做全数据集验证的版本是：
 
-- `eventdensvar_main`
+- `spikeselectprop_res005_itr10`
 
 原因：
 
-- 它是当前工作区保留候选
-- `HumanActivity` 上已经明显优于统一主线母体
-- `USHCN` 上虽然略弱于统一主线母体，但已经收敛到可接受水平
-- 它是后续如果继续沿 `event density` 方向推进的直接起点
+- 它是当前最新的结构候选；
+- `USHCN itr=10 = 0.16988 ± 0.00937`，max `0.19176`，优于 `eventgateconst`；
+- `HumanActivity itr=5 = 0.04175 ± 0.00018`，不伤简单数据；
+- 它比纯 `eventgateconst` 更适合讲「spike-driven residual propagation selection」。
+
+上一轮服务器验证对象：
+
+- `eventdensvar_main`
+
+已经确认：
+
+- `HumanActivity` 与 `P12` 可用；
+- `USHCN` 坏轮明显；
+- 因此不再作为当前默认服务器验证对象。
 
 如果只是要做当前默认对照，则仍使用：
 
@@ -45,7 +55,7 @@
 直接运行：
 
 ```bash
-bash scripts/QSHNet/server_validate_eventdensvar_all.sh
+bash scripts/QSHNet/server_validate_spikeselectprop_res005_all.sh
 ```
 
 这个脚本默认：
@@ -61,7 +71,7 @@ bash scripts/QSHNet/server_validate_eventdensvar_all.sh
 如果服务器资源或时间窗口不同，可以临时覆盖：
 
 ```bash
-USE_MULTI_GPU=1 ITR_USHCN=5 ITR_HUMAN=3 ITR_MIMIC_III=3 bash scripts/QSHNet/server_validate_eventdensvar_all.sh
+USE_MULTI_GPU=1 ITR_USHCN=5 ITR_HUMAN=3 ITR_MIMIC_III=3 bash scripts/QSHNet/server_validate_spikeselectprop_res005_all.sh
 ```
 
 支持的环境变量：
@@ -113,7 +123,58 @@ storage/logs/eventdensvar_main_server_validate_YYYYmmdd_HHMMSS/
 - `summary.log`
 - `summary.json`
 
-### 4.2 汇总脚本
+### 4.2 `QSHDiag` 轨迹解析
+
+当前 `QSHNet` 的 epoch 级诊断已经扩展到 route、fused residual、quaternion residual 与核心梯度范数。
+
+如果手动运行训练，建议始终用 `tee` 保存日志：
+
+```bash
+mkdir -p storage/logs/qshdiag
+conda run -n pyomnits python main.py \
+  --is_training 1 \
+  --collate_fn collate_fn \
+  --loss MSE \
+  --d_model 256 \
+  --n_layers 1 \
+  --n_heads 1 \
+  --use_multi_gpu 0 \
+  --dataset_root_path storage/datasets/USHCN \
+  --model_id coupledctxadapt_main \
+  --model_name QSHNet \
+  --dataset_name USHCN \
+  --dataset_id USHCN \
+  --features M \
+  --seq_len 150 \
+  --pred_len 3 \
+  --enc_in 5 \
+  --dec_in 5 \
+  --c_out 5 \
+  --train_epochs 300 \
+  --patience 10 \
+  --val_interval 1 \
+  --itr 10 \
+  --batch_size 16 \
+  --learning_rate 1e-3 \
+  2>&1 | tee storage/logs/qshdiag/ushcn_coupledctxadapt_itr10.log
+```
+
+训练完成后解析 `QSHDiag`：
+
+```bash
+python scripts/QSHNet/extract_qshdiag.py \
+  storage/logs/qshdiag/ushcn_coupledctxadapt_itr10.log \
+  -o storage/logs/qshdiag/ushcn_coupledctxadapt_itr10_qshdiag.csv
+```
+
+判读重点：
+
+1. 先按最终 `metric.json` 将 `itr` 分成好轮与坏轮。
+2. 比较早期 epoch 的 `vali_loss` 是否已经分叉。
+3. 再看 `retain_min / route_logit_std / fused_clip / quat_bound_ratio_max / quat_clip` 是否在坏轮中提前异常。
+4. 最后看梯度范数，尤其是 `L0_membrane_w_grad`、`L0_event_proj_w_grad`、`L0_quat_gate_w_grad` 与 `L0_quat_*_grad`。
+
+### 4.3 汇总脚本
 
 如果中途单独跑了某几个数据集，也可以手动汇总：
 
@@ -134,11 +195,28 @@ python scripts/QSHNet/summarize_variant_results.py \
   --output_json storage/logs/eventdensvar_summary.json
 ```
 
-## 5. 当前参考基线
+## 5. 本轮服务器验证结果
+
+本轮实际得到的 `eventdensvar_main` 服务器结果如下：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|------|----------------|------|
+| `HumanActivity` | 5 | `0.04174 ± 0.00019` | 改善可复现，且稳定 |
+| `USHCN` | 10 | `0.1886 ± 0.0324` | 坏轮明显，未通过统一主线门槛 |
+| `P12` | 5 | `0.30092 ± 0.00062` | 结果稳定，通过 |
+| `MIMIC_III` | 5 | `0.39791 ± 0.01530` | 均值可接受，但仍有单轮失稳 |
+
+本轮结论：
+
+1. `eventdensvar_main` 不能升级为新的统一主线。
+2. 它仍可保留为 `event density` 方向的工作区候选。
+3. 如果后续继续优化，重点应只放在压制 `USHCN` 坏轮，且不能破坏 `HumanActivity / P12`。
+
+## 6. 当前参考基线
 
 服务器结果回来后，默认与下面几组值对比：
 
-### 5.1 统一主线母体
+### 6.1 统一主线母体
 
 - `eventscalecap_main`
   - HumanActivity: `0.0430 ± 0.0013`
@@ -147,18 +225,18 @@ python scripts/QSHNet/summarize_variant_results.py \
 - `eventscalecap_itr10`
   - USHCN: `0.1728 ± 0.0222`
 
-### 5.2 当前工作区保留候选
+### 6.2 当前工作区保留候选
 
 - `eventdensvar_main`
   - HumanActivity: `0.04181 ± 0.00011`
   - USHCN: `0.1703 ± 0.0058`
 
-### 5.3 最保守稳定版本
+### 6.3 最保守稳定版本
 
 - `retaincap_main`
   - USHCN: `0.1673 ± 0.0033`
 
-## 6. 当前推荐判读方式
+## 7. 当前推荐判读方式
 
 1. 先看 `HumanActivity` 是否继续保持在 `0.0418` 量级附近。
 2. 再看 `USHCN itr=10` 是否仍维持比 `eventnorm_itr10` 更稳的长重复表现。
@@ -167,7 +245,14 @@ python scripts/QSHNet/summarize_variant_results.py \
    - `eventdensvar_main` 是否值得升级成新的跨数据集候选
    - 或者仍只保留为 `event density` 方向的工作区保留候选
 
-## 7. 相关文档
+按本轮实际结果，应使用更明确的判读口径：
+
+1. `HumanActivity` 已通过。
+2. `P12` 已通过。
+3. `MIMIC_III` 基本可接受，但还不是完全稳定版本。
+4. `USHCN` 未通过，因此当前版本不能升级为统一主线。
+
+## 8. 相关文档
 
 - [QSHNet_overview.md](/opt/Codes/PyOmniTS/docs/QSHNet_overview.md)
 - [QSHNet_naming_conventions.md](/opt/Codes/PyOmniTS/docs/QSHNet_naming_conventions.md)

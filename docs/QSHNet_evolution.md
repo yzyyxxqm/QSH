@@ -258,6 +258,128 @@ v1~v8 的反复失败证明：任何改变 HyperIMTS 核心消息传递机制的
 
 ### 阶段 1：bounded-gate 保守稳定化（已回退）
 
+---
+
+## USHCN 尾部压制试验补充记录（2026-04-19）
+
+这一轮工作的目标不是继续做常规超参数扫描，而是回答一个更具体的问题：
+
+- 在当前 `variable residual only + adaptive fused-cap` 主线已经无法稳定压住 `USHCN itr=10` 坏轮的前提下，下一步到底该继续碰哪里？
+
+围绕这个问题，已经完成以下 4 个单因素结构试验。
+
+### 1. `eventgateconst`：解除 `event_gate` 对 `route_logit` 的直接耦合
+
+改动：
+
+- 将
+  - `event_gate = exp(event_log_scale) * sigmoid(route_logit)`
+- 改为
+  - `event_gate = 0.5 * exp(event_log_scale)`
+
+语义：
+
+- route 仍然控制 `retain`
+- route 仍然参与 density 统计
+- 但 route 不再直接放大 event 注入幅度
+
+**USHCN itr=10：**
+
+- `0.1561, 0.1905, 0.2156, 0.1660, 0.1670, 0.1788, 0.1702, 0.1697, 0.1708, 0.1739`
+- 均值 `0.17587`
+- std `0.01571`
+- max `0.21558`
+
+**结论：**
+
+- 这是最近一轮尾部压制试验里唯一明确有效的方向
+- 它没有解决全部坏轮
+- 但它显著优于 `routebound075 / eventprojgrad2 / routeconfvar / memgradclip012 / routecenter`
+- 当前应把它视为“最值得继续围绕的候选结构”
+
+### 2. `eventgateconst_quat020`：压低 quaternion residual cap（失败）
+
+改动：
+
+- `quat_residual_ratio_max: 0.25 -> 0.20`
+
+**USHCN itr=10：**
+
+- `0.1584, 0.1936, 0.2103, 0.1633, 0.1672, 0.1796, 0.1716, 0.1677, 0.1705, 0.1729`
+- 均值 `0.17550`
+- std `0.01473`
+- max `0.21027`
+
+**结论：**
+
+- 数值只比 `eventgateconst` 略有改善
+- 但诊断日志里 `quat_clip = 0.0`
+- 说明 residual cap 基本没有真正触发
+- 因此它不是根因级改动，已回退
+
+### 3. `eventgateconst_meminit001`：给 `membrane_proj` 小随机初始化（失败）
+
+假设：
+
+- 坏轮可能来自 route 早期分散度起不来
+
+改动：
+
+- `membrane_proj.weight` 从零初始化改为 `std=0.01` 小随机初始化
+
+**USHCN itr=10：**
+
+- `0.2481, 0.1705, 0.1651, 0.1719, 0.4619, 0.2173, 0.1789, 0.1682, 0.1820, 0.1749`
+- 均值 `0.21388`
+- std `0.08635`
+- max `0.46190`
+
+**结论：**
+
+- 明显失败
+- 人为抬高早期 route dispersion 会破坏稳定性
+- 该方向已经证伪，已回退
+
+### 4. `eventgateconst_routedetach`：切断 route density 到稳定化支路的反向梯度（失败）
+
+假设：
+
+- 坏轮可能来自 density-aware 稳定化分支反向牵引 `route_logit`
+
+改动：
+
+- 在 `summarize_route_density` 中对 `route_logit` 做 `detach()`
+
+**USHCN itr=10：**
+
+- `0.1595, 0.1933, 0.1625, 0.1694, 0.1673, 0.2329, 0.1642, 0.1724, 0.2184, 0.1723`
+- 均值 `0.18122`
+- std `0.02408`
+- max `0.23287`
+
+**结论：**
+
+- 也明显失败
+- 说明 route density 虽然带来风险，但不能简单切断其训练反馈
+- 该方向已回退
+
+### 当前阶段性总判断
+
+截至 2026-04-19，围绕 `USHCN` 尾部压制的最新结论是：
+
+1. `eventgateconst` 是当前唯一明确值得保留的候选。
+2. 直接压 quaternion residual cap 不是根因修复。
+3. 直接提高 route 初始分散度会明显恶化稳定性。
+4. 直接切断 route density 的反向梯度也会恶化稳定性。
+5. 后续不应继续重复：
+   - `membrane` 初始化改动
+   - route density detach
+   - 单纯 residual cap 收缩
+6. 下一步如果继续做结构试验，应该把注意力放在：
+   - `eventgateconst` 框架下
+   - quaternion 参数演化方式本身
+   - 而不是继续粗暴碰 route 前端
+
 在不改变 M1 总体结构的前提下，曾尝试将 `retain_gate`、`event_gate` 与 `event_residual_scale` 的增长改为更保守的有界形式。
 
 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
@@ -963,10 +1085,640 @@ v1~v8 的反复失败证明：任何改变 HyperIMTS 核心消息传递机制的
 - 但它已经达到“结果可接受、值得保留”的状态
 - 若后续继续沿 `event density` 方向推进，应以它为直接起点，而不是回到更激进的全路径收缩
 
+### 阶段 5：服务器四数据集正式验证
+
+在本地筛选确认 `eventdensvar_main` 可保留之后，进一步对它做了服务器四数据集验证：
+
+| 配置 | 数据集 | 轮数 | 结果 |
+|------|--------|------|------|
+| `eventdensvar_main` | HumanActivity | 5 | **0.04174 ± 0.00019** |
+| `eventdensvar_main` | USHCN | 10 | **0.1886 ± 0.0324** |
+| `eventdensvar_main` | P12 | 5 | **0.30092 ± 0.00062** |
+| `eventdensvar_main` | MIMIC_III | 5 | **0.39791 ± 0.01530** |
+
+对应单轮结果：
+
+- HumanActivity：`0.041741`、`0.041906`、`0.041728`、`0.041872`、`0.041431`
+- USHCN：`0.159863`、`0.167083`、`0.223942`、`0.162037`、`0.165167`、`0.209938`、`0.162052`、`0.168732`、`0.226081`、`0.240721`
+- P12：`0.301369`、`0.300219`、`0.301650`、`0.300377`、`0.300964`
+- MIMIC_III：`0.391491`、`0.425247`、`0.389874`、`0.391132`、`0.391809`
+
+#### 服务器验证结论
+
+- `HumanActivity` 上的改善被再次确认，而且稳定复现
+- `P12` 结果稳定，通过跨数据集可用性检查
+- `MIMIC_III` 均值保持在可接受区间，但仍存在单轮失稳
+- `USHCN` 在 `itr=10` 下重新出现明显坏轮，说明本地 `itr=5` 的“可接受”并不能外推为正式稳定结论
+
+因此这一步之后，`eventdensvar_main` 的最终定位需要进一步收紧为：
+
+- 它仍然是当前 `event density` 方向唯一值得保留的候选
+- 但它不能升级为新的统一主线
+- 当前统一主线仍应保持为 `eventscalecap_main / eventscalecap_itr10`
+- 后续若继续沿这条线推进，唯一合理目标是压制 `USHCN` 坏轮，同时不能破坏 `HumanActivity / P12` 的已确认收益
+
 ### 这轮试验链带来的新增约束
 
 1. 不要再做全局 `event residual` 比例硬约束。
 2. 不要再同时对 temporal / variable 两条路径做 density-aware 收缩。
 3. 若继续推进 `event density` 方向，只看 variable 路径。
 4. `eventscalecap_main / eventscalecap_itr10` 仍是统一主线母体；
-   `eventdensvar_main` 则是当前可接受保留候选。
+   `eventdensvar_main` 则是当前保留候选，而不是新的统一主线。
+5. 后续若继续做结构优化，优先目标不再是进一步改善 `HumanActivity`，
+   而是只针对 `USHCN` 坏轮做抑制，并同时守住 `P12 / MIMIC_III` 的可接受区间。
+
+## 2026-04-18：`variable residual only` 后的长重复坏轮诊断准备
+
+在 `USHCN itr=5` 达到可接受结果后，继续做了 `USHCN itr=10` 长重复检查。
+
+### 当前接受主线
+
+当前工作区默认保留的是：
+
+- `adaptive fused-cap`
+- `variable residual only` fused-context 稳定化
+- 不启用 quaternion risk ceiling
+- 不启用 retain risk ceiling
+
+该结构的核心含义是：
+
+- temporal context 继续保持原路径，不做 fused residual 截断；
+- variable context 只保留相对 base context 的有界残差；
+- fused route density 取 temporal 与 variable 两条路径的最大值，用于自适应收紧 variable residual cap；
+- 事件注入、retain 调制与 quaternion residual 都保持可训练，但不再额外叠加单点 ceiling。
+
+### 已确认结果
+
+`variable residual only` 在 `USHCN itr=5` 上的结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 5 | `0.16785 ± 0.00772` | `0.17962` | 用户接受，作为当前可用主线 |
+
+对应单轮 MSE：
+
+- `0.159564`
+- `0.164314`
+- `0.170925`
+- `0.179617`
+- `0.164842`
+
+同一结构在 `USHCN itr=10` 上的结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.18516 ± 0.02619` | `0.23737` | 长重复下仍有坏尾 |
+
+对应单轮 MSE：
+
+- `0.173720`
+- `0.163736`
+- `0.184923`
+- `0.167952`
+- `0.164524`
+- `0.173355`
+- `0.163550`
+- `0.237369`
+- `0.202104`
+- `0.220376`
+
+### 已失败的单点 ceiling 试验
+
+#### quaternion risk ceiling
+
+- `USHCN itr=10`: `0.18779 ± 0.03152`
+- 单轮最大值：`0.24483`
+- 结论：没有压低坏轮上界，反而略差，已撤回。
+
+#### retain risk ceiling
+
+- `USHCN itr=10`: `0.18539 ± 0.02794`
+- 单轮最大值：`0.24303`
+- 结论：没有解决坏尾，已撤回。
+
+### 当前诊断判断
+
+坏轮不应再简单归因于某一个 gate 过大。更合理的判断是：
+
+- 坏轮来自训练轨迹差异，而不是前几轮污染后几轮；
+- 每个 `itr` 使用独立 seed 与独立模型初始化；
+- 高风险 seed 下，retain、variable fused residual 与 quaternion residual 的组合更容易进入放大轨迹；
+- 单独压 quaternion 或单独压 retain 都不足以解决问题。
+
+### 本次新增诊断能力
+
+为避免继续猜测式结构修改，当前代码新增了更细粒度的 `QSHDiag` 轨迹日志。
+
+每个 epoch 现在会记录：
+
+- `train_loss / vali_loss / lr`
+- `retain_mean / retain_min / retain_std`
+- `event_mean / event_max`
+- `route_logit_mean / route_logit_std`
+- `temporal_density_mean / variable_density_mean`
+- `temporal_ratio_mean / variable_ratio_mean`
+- `fused_clip / fused_ratio_mean / fused_cap_mean`
+- `quat_alpha_mean / quat_alpha_max`
+- `quat_raw_ratio_mean / quat_bound_ratio_mean / quat_bound_ratio_max / quat_clip`
+- 核心梯度范数：`retain_log_scale`、`membrane_proj`、`event_proj`、`event_residual_scale`、`quat_gate`、`quat_h2n`
+
+同时新增解析脚本：
+
+```bash
+python scripts/QSHNet/extract_qshdiag.py train.log -o qshdiag.csv
+```
+
+后续判断 `USHCN itr=10` 坏轮时，应优先比较好轮与坏轮在早期 epoch 的这些字段，而不是继续直接添加新的 gate。
+
+## 2026-04-18：`USHCN itr=10` 轨迹诊断与 route-bound 失败试验
+
+在新增 `QSHDiag` 后，重新对当前 `variable residual only + adaptive fused-cap` 主线做了一轮本地 `USHCN itr=10` 诊断运行。
+
+运行版本：
+
+- `model_id = coupledctxadapt_diag_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_coupledctxadapt_diag_itr10_20260418_230326.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_coupledctxadapt_diag_itr10_20260418_230326_qshdiag.csv`
+
+### 诊断运行结果
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.19035 ± 0.03078` | `0.25503` | 坏轮仍存在 |
+
+单轮 MSE：
+
+- `iter0`: `0.172467`
+- `iter1`: `0.173562`
+- `iter2`: `0.176772`
+- `iter3`: `0.169073`
+- `iter4`: `0.164354`
+- `iter5`: `0.172374`
+- `iter6`: `0.168195`
+- `iter7`: `0.255032`
+- `iter8`: `0.230167`
+- `iter9`: `0.221551`
+
+### 诊断发现
+
+用 `metric.json` 将 `MSE >= 0.20` 的 iteration 标为坏轮后，对比好轮和坏轮早期 epoch，主要差异集中在：
+
+- `L0_route_logit_std`
+- `L0_membrane_w_grad`
+
+代表性现象：
+
+- epoch 4：坏轮 `L0_route_logit_std` 高于好轮约 `+0.1746`
+- epoch 5：坏轮 `L0_route_logit_std` 高于好轮约 `+0.2696`
+- epoch 4：坏轮 `L0_membrane_w_grad` 高于好轮约 `+0.9577`
+
+而以下字段不是最早、最稳定的异常来源：
+
+- `quat_alpha_mean`
+- `quat_bound_ratio_max`
+- `fused_clip`
+
+这说明坏轮并不是 quaternion residual 单独过强，也不是 fused residual cap 单独失效；更像是 spike route 轨迹进入了不同状态。
+
+### 单因素试验：`routebound075`
+
+基于上述诊断，尝试只改一个核心因素：
+
+- 在 `SpikeRouter` 内对 `route_logit` 加 `tanh` 软边界
+- 边界：`abs(route_logit) <= 0.75`
+- 其他结构不变
+
+运行版本：
+
+- `model_id = routebound075_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_routebound075_itr10_20260418_232439.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_routebound075_itr10_20260418_232439_qshdiag.csv`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.18132 ± 0.02602` | `0.25184` | 均值略降，但坏轮上界未解决 |
+
+单轮 MSE：
+
+- `iter0`: `0.191665`
+- `iter1`: `0.166341`
+- `iter2`: `0.196957`
+- `iter3`: `0.163167`
+- `iter4`: `0.166984`
+- `iter5`: `0.168853`
+- `iter6`: `0.163077`
+- `iter7`: `0.251841`
+- `iter8`: `0.175908`
+- `iter9`: `0.168407`
+
+### `routebound075` 结论
+
+- `routebound075` 压低了原本部分后段坏轮，但没有压住 `iter7`。
+- 单轮最大值 `0.25184` 高于当前可接受目标 `<= 0.18`，也高于前一轮诊断运行的坏轮上界。
+- 该试验不能进入主线，代码已撤回。
+
+更重要的是，`routebound075` 让坏轮的主要差异从 route dispersion 转移到 `event_proj_w_norm` 偏低：
+
+- 早期/中期 epoch 中，坏轮 `L0_event_proj_w_norm` 持续低于好轮约 `0.7 ~ 0.8`
+
+这说明：
+
+1. 单纯压 route logit 分布宽度不是充分修复。
+2. 坏轮可能与 event projection 是否充分学起来有关。
+3. 后续如果继续结构优化，应考虑“让 event projection 学得更稳”或“避免 event projection 学不足时影响主干”的机制，而不是继续压 `route_logit`、`retain_gate` 或 `quat_gate`。
+
+## 2026-04-19：`eventprojgrad2` 失败试验
+
+在 `routebound075` 失败后，进一步检查原主线与 `routebound075` 的坏轮轨迹，发现坏轮普遍伴随 `L0_event_proj_w_norm` 偏低：
+
+- 原主线诊断运行中，坏轮 `event_proj_w_norm` 在早期 epoch 低于好轮约 `0.15 ~ 0.30`
+- `routebound075` 中，这个差距扩大到约 `0.7 ~ 0.8`
+
+因此尝试只改一个训练动力学因素：
+
+- 不改前向结构；
+- 不改 `route_logit`、`retain_gate`、`quat_gate`；
+- 只给 `SpikeRouter.event_proj.weight/bias` 注册梯度 hook；
+- 将 `event_proj` 的梯度放大 `2x`。
+
+运行版本：
+
+- `model_id = eventprojgrad2_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_eventprojgrad2_itr10_20260419_085215.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_eventprojgrad2_itr10_20260419_085215_qshdiag.csv`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.18962 ± 0.03279` | `0.26653` | 坏轮更差，失败 |
+
+单轮 MSE：
+
+- `iter0`: `0.181543`
+- `iter1`: `0.165239`
+- `iter2`: `0.176374`
+- `iter3`: `0.170394`
+- `iter4`: `0.162720`
+- `iter5`: `0.172497`
+- `iter6`: `0.161393`
+- `iter7`: `0.266528`
+- `iter8`: `0.220469`
+- `iter9`: `0.219089`
+
+### 结论
+
+`eventprojgrad2` 没有解决坏轮，反而把最大坏轮推高到 `0.26653`。
+
+这说明：
+
+1. `event_proj_w_norm` 偏低确实是坏轮相关信号，但不能简单理解为“让 event_proj 学得更快就会更稳”。
+2. 坏轮更可能来自 event route / event projection / fused context 之间的耦合轨迹，而不是单一参数学习速度不足。
+3. 继续做单点放大、单点 ceiling、单点梯度倍率都不合适。
+4. 后续更合理的结构方向应转向“事件支路置信度/可用性控制”：当 event projection 没有形成稳定表征时，降低其对主干上下文的有效影响；当其稳定后再允许参与。
+
+该试验代码已撤回，不进入主线。
+
+## 2026-04-19：`routeconfvar` 失败试验
+
+在 `eventprojgrad2` 失败后，进一步尝试“事件支路置信度/可用性控制”的最小版本。
+
+设计目标：
+
+- 不改 `retain_gate`、`quat_gate`、`route_logit` 本身；
+- 不再加速 `event_proj` 学习；
+- 只在 `variable` event residual 注入处加入 route dispersion 感知衰减；
+- 当 batch 内 `route_logit.std` 偏高时，将 variable event 注入强度降到最低 `0.7x`；
+- temporal event 路径保持不变。
+
+运行版本：
+
+- `model_id = routeconfvar_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_routeconfvar_itr10_20260419_091933.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_routeconfvar_itr10_20260419_091933_qshdiag.csv`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.19155 ± 0.03720` | `0.26306` | 后段坏轮更差，失败 |
+
+单轮 MSE：
+
+- `iter0`: `0.154662`
+- `iter1`: `0.164823`
+- `iter2`: `0.170017`
+- `iter3`: `0.162109`
+- `iter4`: `0.163685`
+- `iter5`: `0.162282`
+- `iter6`: `0.214549`
+- `iter7`: `0.263061`
+- `iter8`: `0.220784`
+- `iter9`: `0.239500`
+
+早期 `QSHDiag` 对比显示，坏轮仍然主要伴随：
+
+- `L0_membrane_w_grad` 偏高；
+- `L0_route_logit_std` 偏高；
+- `L0_event_proj_w_norm` 略低；
+- 新增的 `variable_route_stability` 确实在坏轮中降低，但没有阻断坏轮。
+
+### 结论
+
+`routeconfvar` 说明：仅根据 route dispersion 衰减 variable event residual 不是有效稳定化手段。
+
+这进一步排除了一个方向：
+
+- 不应继续做“看到 route 不稳定就直接缩 event 注入”的局部规则；
+- 坏轮不是单纯由 event residual 注入强度过大造成；
+- `membrane_proj` 的早期梯度轨迹仍然是更核心的风险信号。
+
+该试验代码已撤回，不进入主线。当前代码仍回到 `variable residual only + adaptive fused-cap` 主线。
+
+## 2026-04-19：`routecenter` 失败试验
+
+在 `memgradclip012` 失败后，进一步尝试一个更上层的 route 动力学控制：
+
+- 不裁剪梯度；
+- 不做 route logit 幅值 bound；
+- 不改 retain / event / quaternion；
+- 只把 `membrane` 输出在每个样本内做均值中心化；
+- 使 route logit 表达“相对异常程度”，避免某些 seed 早期整体 route density 漂移。
+
+运行版本：
+
+- `model_id = routecenter_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_routecenter_itr10_20260419_101545.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_routecenter_itr10_20260419_101545_qshdiag.csv`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.18433 ± 0.03669` | `0.27430` | 坏轮更差，失败 |
+
+单轮 MSE：
+
+- `iter0`: `0.160960`
+- `iter1`: `0.274295`
+- `iter2`: `0.162089`
+- `iter3`: `0.167135`
+- `iter4`: `0.164695`
+- `iter5`: `0.172360`
+- `iter6`: `0.163384`
+- `iter7`: `0.170591`
+- `iter8`: `0.236354`
+- `iter9`: `0.171457`
+
+早期 `QSHDiag` 对比显示：
+
+- route mean 被中心化后，坏轮仍然存在；
+- 坏轮 `L0_route_logit_std` 仍高于好轮；
+- `epoch=6` 坏轮 `route_logit_std` 比好轮高约 `+0.2324`；
+- 坏轮 `L0_event_proj_w_norm` 仍偏低；
+- `iter1 = 0.27430` 说明均值中心化可能引入新的早期不稳定。
+
+### 结论
+
+`routecenter` 说明：坏轮不是简单的 route mean 漂移问题。
+
+这进一步排除：
+
+- 直接对 route logit 做均值中心化；
+- 继续围绕 route 的一阶统计量做局部修补；
+- 把 USHCN 坏轮简单归因于 route density 整体偏高。
+
+该试验代码已撤回，不进入主线。当前代码仍回到 `variable residual only + adaptive fused-cap` 主线。
+
+## 2026-04-19：`spikeselectprop_a1` 传播选择版 spike 试验（失败）
+
+在 `eventgateconst` 成为当前唯一值得保留的尾部压制候选后，进一步从论文叙事角度尝试把 spike 从「event 幅值控制器」改成「传播选择器」：
+
+- 保留 `eventgateconst`；
+- 不改 `event_residual_scale`；
+- 不改 fused-cap；
+- 不改 quaternion refinement；
+- 新增 `selection_weight = sigmoid(route_logit)`；
+- 在 node-to-hyperedge 前把 `obs_base` 改为 `obs_selected = obs_base * selection_weight`；
+- 即让 spike 显式控制 observation 对 temporal / variable 超图传播的参与强度。
+
+运行版本：
+
+- `model_id = spikeselectprop_a1_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_spikeselectprop_a1_itr10.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_spikeselectprop_a1_itr10_qshdiag.csv`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.19942 ± 0.02713` | `0.26434` | 明显退化，失败 |
+
+单轮 MSE：
+
+- `iter0`: `0.207281`
+- `iter1`: `0.204167`
+- `iter2`: `0.193034`
+- `iter3`: `0.182432`
+- `iter4`: `0.227393`
+- `iter5`: `0.177274`
+- `iter6`: `0.169384`
+- `iter7`: `0.191883`
+- `iter8`: `0.264342`
+- `iter9`: `0.177034`
+
+与 `eventgateconst` 对比：
+
+| 版本 | USHCN itr=10 MSE | std | max | `>0.18` 轮数 | `>=0.20` 轮数 |
+|------|------------------|-----|-----|--------------|---------------|
+| `eventgateconst` | `0.17587` | `0.01571` | `0.21558` | 3 | 1 |
+| `spikeselectprop_a1` | `0.19942` | `0.02713` | `0.26434` | 7 | 4 |
+
+### 结论
+
+`spikeselectprop_a1` 证明：把 `sigmoid(route_logit)` 直接乘到 node-to-hyperedge observation message 上，虽然叙事更像「spike-driven propagation selection」，但数值上会明显破坏 `USHCN` 稳定性。
+
+这一结果说明：
+
+1. 不能把传播前节点特征幅值选择作为下一步主线。
+2. `route_logit` 直接控制超图传播输入会重新放大坏轮。
+3. 如果后续仍要保留「spike 负责传播选择」的论文叙事，必须改成更温和或更结构化的选择机制，例如 attention-level bias、残差式选择或 detach/stop-gradient 的解释性诊断，而不是直接缩放 observation message。
+4. 当前工程主线仍应回到 `eventgateconst`，而不是升级到 `spikeselectprop_a1`。
+
+补充实现状态：
+
+- `spikeselectprop_a1` 的 n2h 输入缩放接线已撤回；
+- 当前代码只保留 `selection_weight` 字段和 `QSHDiag` 中的 `selection_mean / selection_std` 输出；
+- 这些字段仅作为后续结构诊断使用，不能视为传播选择结构已经进入主线。
+
+## 2026-04-19：`spikeselectprop_res010` 与 `spikeselectprop_res005`
+
+在 `spikeselectprop_a1` 失败后，重新分析失败原因：
+
+- `selection_weight = sigmoid(route_logit)` 在初始 `route_logit = 0` 时等于 `0.5`；
+- A1 直接把它乘到 n2h observation message 上，等价于初始化时把主传播消息砍半；
+- 这破坏了 QSHNet 原先强调的 identity initialization。
+
+因此下一步改成 identity-preserving 的 residual-style propagation selection：
+
+```text
+selection_factor = 1 + strength * (selection_weight - 0.5)
+obs_selected = obs_base * selection_factor
+```
+
+这样当 `route_logit = 0` 时：
+
+- `selection_weight = 0.5`
+- `selection_factor = 1.0`
+- 主传播路径初始化完全不变
+
+### 1. `spikeselectprop_res010`
+
+配置：
+
+- `model_id = spikeselectprop_res010_itr10`
+- `strength = 0.10`
+- propagation factor 理论范围：`[0.95, 1.05]`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | `>0.18` | `>=0.20` | 结论 |
+|------|------|----------------|------------|---------|----------|------|
+| `USHCN` | 10 | `0.17535 ± 0.02540` | `0.24952` | 1 | 1 | 均值可接受，但仍有重坏轮 |
+
+单轮 MSE：
+
+- `0.160001`
+- `0.166898`
+- `0.160524`
+- `0.169134`
+- `0.167477`
+- `0.178372`
+- `0.166310`
+- `0.249522`
+- `0.160085`
+- `0.175136`
+
+### 2. `spikeselectprop_res005`
+
+配置：
+
+- `model_id = spikeselectprop_res005_itr10`
+- `strength = 0.05`
+- propagation factor 理论范围：`[0.975, 1.025]`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | `>0.18` | `>=0.20` | 结论 |
+|------|------|----------------|------------|---------|----------|------|
+| `USHCN` | 10 | `0.16988 ± 0.00937` | `0.19176` | 1 | 0 | 当前最好的 USHCN 尾部压制候选 |
+
+补充 `HumanActivity itr=5` 对照：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `HumanActivity` | 5 | `0.04175 ± 0.00018` | `0.04202` | 稳定，不伤简单数据 |
+
+单轮 MSE：
+
+- `0.191765`
+- `0.166750`
+- `0.159756`
+- `0.168307`
+- `0.166594`
+- `0.178131`
+- `0.164333`
+- `0.169557`
+- `0.158004`
+- `0.175644`
+
+诊断摘要：
+
+- `L0_selection_factor_mean` 平均约 `0.99485`
+- `L0_selection_factor_std` 平均约 `0.00393`
+- `L0_quat_clip = 0.0`
+- 没有 `>=0.20` 的重坏轮
+
+### 结论
+
+`spikeselectprop_res005` 是目前最值得保留的新候选。
+
+它同时满足两个目标：
+
+1. 数值上优于 `eventgateconst`
+   - `eventgateconst`: `0.17587 ± 0.01571`, max `0.21558`
+   - `spikeselectprop_res005`: `0.16988 ± 0.00937`, max `0.19176`
+
+2. 叙事上比纯 `eventgateconst` 更好
+   - spike 不再只是 event gate 的工程补丁；
+   - 它以 identity-preserving residual bias 的形式参与超图传播；
+   - hypergraph 仍是主干；
+   - quaternion refinement 不变。
+
+当前代码保留 `strength = 0.05` 的 residual-style propagation selection，作为下一步候选。
+
+`HumanActivity` 对照进一步说明：
+
+- `spikeselectprop_res005` 没有破坏简单数据集；
+- 其 Human 表现与已知稳定候选 `eventdensvar_main` 的 `0.04174 ± 0.00019` 基本一致；
+- 因此该结构已经通过本地两数据集初筛，下一步可以准备服务器覆盖 `P12 / MIMIC_III`。
+
+## 2026-04-19：`memgradclip012` 失败试验
+
+在 `routeconfvar` 失败后，进一步回到诊断里反复出现的核心风险信号：坏轮早期 `L0_membrane_w_grad` 偏高。
+
+本轮只改一个训练动力学因素：
+
+- 不改 forward；
+- 不改 `route_logit` 输出；
+- 不改 `retain`、`event`、`quaternion` 分支结构；
+- 只给 `SpikeRouter.membrane_proj.weight/bias` 注册梯度 hook；
+- 将 `membrane_proj` 梯度范数裁剪到 `0.12`。
+
+运行版本：
+
+- `model_id = memgradclip012_itr10`
+- 日志：`storage/logs/qshdiag/ushcn_memgradclip012_itr10_20260419_094815.log`
+- 解析 CSV：`storage/logs/qshdiag/ushcn_memgradclip012_itr10_20260419_094815_qshdiag.csv`
+
+结果：
+
+| 数据集 | 轮数 | MSE 均值 ± std | 单轮最大值 | 结论 |
+|------|------|----------------|------------|------|
+| `USHCN` | 10 | `0.17775 ± 0.02485` | `0.23575` | 均值尚可，但坏轮上界未解决 |
+
+单轮 MSE：
+
+- `iter0`: `0.163060`
+- `iter1`: `0.164567`
+- `iter2`: `0.165143`
+- `iter3`: `0.163402`
+- `iter4`: `0.163231`
+- `iter5`: `0.235747`
+- `iter6`: `0.164059`
+- `iter7`: `0.217172`
+- `iter8`: `0.170672`
+- `iter9`: `0.170477`
+
+早期 `QSHDiag` 对比显示：
+
+- 坏轮的 `L0_route_logit_std` 仍然显著高于好轮；
+- `epoch=2` 坏轮 `route_logit_std` 比好轮高约 `+0.3610`；
+- `epoch=3` 坏轮 `route_logit_std` 比好轮高约 `+0.3014`；
+- 坏轮 `L0_event_proj_w_norm` 仍然偏低；
+- `membrane` 梯度虽然被裁剪，但 route dispersion 仍会快速拉大。
+
+### 结论
+
+`memgradclip012` 说明：坏轮不能通过直接裁剪 `membrane_proj` 梯度范数解决。
+
+更准确的判断是：
+
+1. `membrane_w_grad` 偏高是风险信号，但不是单独可控的充分因子。
+2. 直接裁剪梯度没有阻断 route dispersion，反而仍出现 `0.23575` 级别坏轮。
+3. 后续不应继续在 `membrane_proj` 上做简单梯度倍率或梯度裁剪。
+4. 如果继续处理 route 动力学，需要设计更上层的机制，而不是单点 hook。
+
+该试验代码已撤回，不进入主线。当前代码仍回到 `variable residual only + adaptive fused-cap` 主线。

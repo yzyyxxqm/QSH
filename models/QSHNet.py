@@ -130,7 +130,8 @@ class SpikeRouter(nn.Module):
         route_logit = membrane
         retain_strength = self.compute_retain_strength()
         retain_gate = 1.0 - retain_strength * torch.sigmoid(-route_logit)
-        event_gate = torch.exp(self.event_log_scale) * torch.sigmoid(route_logit)
+        selection_weight = torch.sigmoid(route_logit)
+        event_gate = torch.full_like(route_logit, 0.5) * torch.exp(self.event_log_scale)
         event_features = self.event_proj(torch.cat([obs, deviation], dim=-1))
         obs_base = obs * retain_gate.unsqueeze(-1) * mask_d
         obs_event = event_features * event_gate.unsqueeze(-1) * mask_d
@@ -145,6 +146,7 @@ class SpikeRouter(nn.Module):
             "retain_gate": retain_gate,
             "event_gate": event_gate,
             "route_logit": route_logit,
+            "selection_weight": selection_weight,
         }
 
 
@@ -301,6 +303,9 @@ class HypergraphLearner(nn.Module):
         self.event_density_baseline = 0.5
         self.temporal_event_density_penalty_max = 0.0
         self.variable_event_density_penalty_max = 0.5
+        self.coupled_residual_ratio_max = 0.20
+        self.coupled_residual_ratio_min = 0.12
+        self.propagation_selection_strength = 0.05
         self.temporal_event_norm = nn.ModuleList([
             nn.LayerNorm(d_model) for _ in range(n_layers)])
         self.variable_event_norm = nn.ModuleList([
@@ -341,6 +346,40 @@ class HypergraphLearner(nn.Module):
         residual_scale = torch.clamp(max_residual_norm / residual_norm, max=1.0)
         return residual * residual_scale
 
+    def summarize_quaternion_diagnostics(self, linear_out, quat_out, alpha, quat_residual):
+        linear_norm = linear_out.norm(dim=-1).clamp(min=1e-6)
+        raw_residual_norm = (alpha * quat_out).norm(dim=-1)
+        bounded_residual_norm = quat_residual.norm(dim=-1)
+        return {
+            "alpha_mean": alpha.detach().float().mean().item(),
+            "alpha_max": alpha.detach().float().max().item(),
+            "linear_norm_mean": linear_norm.detach().float().mean().item(),
+            "quat_norm_mean": quat_out.detach().norm(dim=-1).float().mean().item(),
+            "raw_residual_ratio_mean": (raw_residual_norm / linear_norm).detach().float().mean().item(),
+            "bounded_residual_ratio_mean": (bounded_residual_norm / linear_norm).detach().float().mean().item(),
+            "bounded_residual_ratio_max": (bounded_residual_norm / linear_norm).detach().float().max().item(),
+            "clip_rate": (raw_residual_norm > self.quat_residual_ratio_max * linear_norm).detach().float().mean().item(),
+        }
+
+    def summarize_route_diagnostics(self, route_state, temporal_route_density, variable_route_density):
+        retain_gate = route_state["retain_gate"].detach().float()
+        event_gate = route_state["event_gate"].detach().float()
+        route_logit = route_state["route_logit"].detach().float()
+        selection_weight = route_state["selection_weight"].detach().float()
+        return {
+            "retain_mean": retain_gate.mean().item(),
+            "retain_min": retain_gate.min().item(),
+            "retain_std": retain_gate.std(unbiased=False).item(),
+            "event_mean": event_gate.mean().item(),
+            "event_max": event_gate.max().item(),
+            "route_logit_mean": route_logit.mean().item(),
+            "route_logit_std": route_logit.std(unbiased=False).item(),
+            "selection_mean": selection_weight.mean().item(),
+            "selection_std": selection_weight.std(unbiased=False).item(),
+            "temporal_density_mean": temporal_route_density.detach().float().mean().item(),
+            "variable_density_mean": variable_route_density.detach().float().mean().item(),
+        }
+
     def normalize_event_delta(self, layer_idx, event_delta, target):
         if target == "temporal":
             return self.temporal_event_norm[layer_idx](event_delta)
@@ -374,12 +413,105 @@ class HypergraphLearner(nn.Module):
         route_density = torch.sigmoid(route_logit).unsqueeze(-1)
         return (incidence_matrix @ route_density) / incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
 
-    def apply_event_injection(self, layer_idx, main_state, event_delta, event_scale, target, route_density=None):
+    def compute_propagation_selection_factor(self, route_state):
+        selection_weight = route_state["selection_weight"].unsqueeze(-1)
+        return 1.0 + self.propagation_selection_strength * (selection_weight - 0.5)
+
+    def summarize_fused_route_density(self, temporal_route_density, variable_route_density):
+        return torch.maximum(temporal_route_density, variable_route_density)
+
+    def stabilize_fused_context(
+        self,
+        temporal_context_base,
+        variable_context_base,
+        temporal_context,
+        variable_context,
+        fused_route_density,
+    ):
+        variable_context_residual = variable_context - variable_context_base
+        bounded_variable_residual, fused_event_diag = self.bound_coupled_residual(
+            variable_context_base,
+            variable_context_residual,
+            fused_route_density=fused_route_density,
+        )
+        stabilized_temporal = temporal_context
+        stabilized_variable = variable_context_base + bounded_variable_residual
+        return stabilized_temporal, stabilized_variable, fused_event_diag
+
+    def compute_adaptive_coupled_ratio_max(self, main_state, coupled_residual, fused_route_density):
+        main_norm = main_state.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        residual_norm = coupled_residual.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        residual_ratio = residual_norm / main_norm
+        density_pressure = torch.clamp(
+            fused_route_density - self.event_density_baseline,
+            min=0.0,
+        ) / max(1e-6, 1.0 - self.event_density_baseline)
+        residual_pressure = torch.clamp(
+            residual_ratio / self.coupled_residual_ratio_max - 1.0,
+            min=0.0,
+            max=1.0,
+        )
+        risk_pressure = torch.maximum(density_pressure, residual_pressure)
+        adaptive_ratio_max = self.coupled_residual_ratio_max - (
+            self.coupled_residual_ratio_max - self.coupled_residual_ratio_min
+        ) * risk_pressure
+        return adaptive_ratio_max.clamp(
+            min=self.coupled_residual_ratio_min,
+            max=self.coupled_residual_ratio_max,
+        )
+
+    def bound_coupled_residual(self, main_state, coupled_residual, fused_route_density=None):
+        main_norm = main_state.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        residual_norm = coupled_residual.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        if fused_route_density is None:
+            adaptive_ratio_max = torch.full_like(main_norm, self.coupled_residual_ratio_max)
+        else:
+            adaptive_ratio_max = self.compute_adaptive_coupled_ratio_max(
+                main_state=main_state,
+                coupled_residual=coupled_residual,
+                fused_route_density=fused_route_density,
+            )
+        max_residual_norm = adaptive_ratio_max * main_norm
+        residual_scale = torch.clamp(max_residual_norm / residual_norm, max=1.0)
+        bounded_residual = coupled_residual * residual_scale
+        ratio = residual_norm / main_norm
+        diagnostics = {
+            "coupled_residual_norm_mean": bounded_residual.norm(dim=-1).mean().item(),
+            "coupled_residual_ratio_mean": ratio.mean().item(),
+            "coupled_residual_ratio_max": ratio.max().item(),
+            "clip_rate": (residual_scale < 1.0).float().mean().item(),
+            "adaptive_ratio_max_mean": adaptive_ratio_max.mean().item(),
+            "fused_route_density_mean": fused_route_density.mean().item() if fused_route_density is not None else float('nan'),
+        }
+        return bounded_residual, diagnostics
+
+    def apply_event_injection(
+        self,
+        layer_idx,
+        main_state,
+        event_delta,
+        event_scale,
+        target,
+        route_density=None,
+        return_diagnostics=False,
+    ):
         if target not in {"temporal", "variable"}:
             raise ValueError(f"Unknown event target: {target}")
         if route_density is not None:
             event_scale = self.modulate_event_scale(event_scale, route_density, target)
-        return main_state + event_scale * event_delta
+        coupled_residual = event_scale * event_delta
+        bounded_state = main_state + coupled_residual
+        if return_diagnostics:
+            residual_norm = coupled_residual.norm(dim=-1)
+            main_norm = main_state.norm(dim=-1).clamp(min=1e-6)
+            diagnostics = {
+                "coupled_residual_norm_mean": residual_norm.mean().item(),
+                "coupled_residual_ratio_mean": (residual_norm / main_norm).mean().item(),
+                "coupled_residual_ratio_max": (residual_norm / main_norm).max().item(),
+                "clip_rate": 0.0,
+            }
+            return bounded_state, diagnostics
+        return bounded_state
 
     def forward(self, observation_nodes, temporal_hyperedges, variable_hyperedges,
                 time_indices_flattened, variable_indices_flattened,
@@ -405,20 +537,30 @@ class HypergraphLearner(nn.Module):
             variable_event_delta = self.normalize_event_delta(i, variable_event_delta, target="variable")
             temporal_route_density = self.summarize_route_density(temporal_incidence_matrix, route_state["route_logit"])
             variable_route_density = self.summarize_route_density(variable_incidence_matrix, route_state["route_logit"])
+            route_diag = self.summarize_route_diagnostics(
+                route_state,
+                temporal_route_density,
+                variable_route_density,
+            )
+            propagation_selection_factor = self.compute_propagation_selection_factor(route_state)
+            route_diag["selection_factor_mean"] = propagation_selection_factor.detach().float().mean().item()
+            route_diag["selection_factor_std"] = propagation_selection_factor.detach().float().std(unbiased=False).item()
+            obs_selected = obs_base * propagation_selection_factor
 
             # Node→temporal hyperedge (using spike-selected nodes)
-            temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
+            temporal_hyperedges_base = self.node2temporal_hyperedge[i](
                 temporal_hyperedges,
                 torch.cat([variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D)),
-                           obs_base], -1),
+                           obs_selected], -1),
                 temporal_incidence_matrix if i != 0 else temporal_incidence_matrix * mask_temp)
-            temporal_hyperedges_updated = self.apply_event_injection(
+            temporal_hyperedges_updated, temporal_event_diag = self.apply_event_injection(
                 layer_idx=i,
-                main_state=temporal_hyperedges_updated,
+                main_state=temporal_hyperedges_base,
                 event_delta=temporal_event_delta,
                 event_scale=event_scale,
                 target="temporal",
                 route_density=temporal_route_density,
+                return_diagnostics=True,
             )
 
             if i == 0:
@@ -426,26 +568,60 @@ class HypergraphLearner(nn.Module):
                 mask_temp[mask_temp == 0] = 1e-8
 
             # Node→variable hyperedge (using spike-selected nodes)
-            variable_hyperedges_updated = self.node2variable_hyperedge[i](
+            variable_hyperedges_base = self.node2variable_hyperedge[i](
                 variable_hyperedges,
                 torch.cat([temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
-                           obs_base], -1),
+                           obs_selected], -1),
                 variable_incidence_matrix if i != 0 else variable_incidence_matrix * mask_temp)
-            variable_hyperedges_updated = self.apply_event_injection(
+            variable_hyperedges_updated, variable_event_diag = self.apply_event_injection(
                 layer_idx=i,
-                main_state=variable_hyperedges_updated,
+                main_state=variable_hyperedges_base,
                 event_delta=variable_event_delta,
                 event_scale=event_scale,
                 target="variable",
                 route_density=variable_route_density,
+                return_diagnostics=True,
             )
 
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated
 
             # Hyperedge→node
+            tg_base = temporal_hyperedges_base.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D))
+            vg_base = variable_hyperedges_base.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
             tg = temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D))
             vg = variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
+            temporal_route_density_gathered = temporal_route_density.gather(
+                1, repeat(time_indices_flattened, "B N -> B N 1")
+            )
+            variable_route_density_gathered = variable_route_density.gather(
+                1, repeat(variable_indices_flattened, "B N -> B N 1")
+            )
+            fused_route_density = self.summarize_fused_route_density(
+                temporal_route_density_gathered,
+                variable_route_density_gathered,
+            )
+            tg, vg, fused_event_diag = self.stabilize_fused_context(
+                temporal_context_base=tg_base,
+                variable_context_base=vg_base,
+                temporal_context=tg,
+                variable_context=vg,
+                fused_route_density=fused_route_density,
+            )
+            fused_risk_pressure = 1.0 - (
+                torch.full_like(
+                    fused_route_density,
+                    self.coupled_residual_ratio_max,
+                ).clamp(min=1e-6)
+            )
+            if not hasattr(self, "latest_event_diagnostics"):
+                self.latest_event_diagnostics = {}
+            self.latest_event_diagnostics[i] = {
+                "temporal": temporal_event_diag,
+                "variable": variable_event_diag,
+                "fused": fused_event_diag,
+                "route": route_diag,
+            }
 
             if not self.oom_flag:
                 try:
@@ -471,6 +647,13 @@ class HypergraphLearner(nn.Module):
             # Additive refinement with learnable gate (starts near 0 → pure HyperIMTS)
             alpha = self.compute_quaternion_gate(i, linear_out, route_state["event_gate"])
             quat_residual = self.bound_quaternion_residual(linear_out, quat_out, alpha)
+            quat_diag = self.summarize_quaternion_diagnostics(
+                linear_out=linear_out,
+                quat_out=quat_out,
+                alpha=alpha,
+                quat_residual=quat_residual,
+            )
+            self.latest_event_diagnostics[i]["quaternion"] = quat_diag
             h2n_out = linear_out + quat_residual
             # Diagnostic logging
             if not hasattr(self, '_h2n_count'):

@@ -111,7 +111,43 @@ class Exp_Main(Exp_Basic):
         criterion = loss_module.Loss(self.configs)
         return criterion
 
-    def _log_qsh_diagnostics(self, model_train: Module, epoch: int, train_stage: int) -> None:
+    def _collect_qsh_gradient_diagnostics(self, model_train: Module) -> dict[str, float]:
+        if 'QSH' not in self.configs.model_name:
+            return {}
+
+        model_ref = accelerator.unwrap_model(model_train)
+        learner = getattr(model_ref, 'hypergraph_learner', None)
+        if learner is None:
+            return {}
+
+        def _grad_norm(param) -> float:
+            if param is None or param.grad is None:
+                return float('nan')
+            return param.grad.detach().norm().item()
+
+        diagnostics = {}
+        for layer_idx, router in enumerate(learner.spike_select):
+            diagnostics[f"L{layer_idx}_retain_log_scale_grad"] = _grad_norm(router.retain_log_scale)
+            diagnostics[f"L{layer_idx}_membrane_w_grad"] = _grad_norm(router.membrane_proj.weight)
+            diagnostics[f"L{layer_idx}_event_proj_w_grad"] = _grad_norm(router.event_proj.weight)
+            diagnostics[f"L{layer_idx}_event_residual_scale_grad"] = _grad_norm(learner.event_residual_scale[layer_idx])
+            diagnostics[f"L{layer_idx}_quat_gate_w_grad"] = _grad_norm(learner.quat_gate[layer_idx].weight)
+            diagnostics[f"L{layer_idx}_quat_gate_b_grad"] = _grad_norm(learner.quat_gate[layer_idx].bias)
+            diagnostics[f"L{layer_idx}_quat_r_grad"] = _grad_norm(learner.quat_h2n[layer_idx].r)
+            diagnostics[f"L{layer_idx}_quat_i_grad"] = _grad_norm(learner.quat_h2n[layer_idx].i)
+            diagnostics[f"L{layer_idx}_quat_j_grad"] = _grad_norm(learner.quat_h2n[layer_idx].j)
+            diagnostics[f"L{layer_idx}_quat_k_grad"] = _grad_norm(learner.quat_h2n[layer_idx].k)
+        return diagnostics
+
+    def _log_qsh_diagnostics(
+        self,
+        model_train: Module,
+        epoch: int,
+        train_stage: int,
+        train_loss_mean: float = float('nan'),
+        vali_loss: float = float('nan'),
+        lr: float = float('nan'),
+    ) -> None:
         if 'QSH' not in self.configs.model_name or not accelerator.is_main_process:
             return
 
@@ -121,10 +157,17 @@ class Exp_Main(Exp_Basic):
             return
 
         debug_event_state = getattr(learner, 'debug_event_state', {}) or {}
+        latest_event_diagnostics = getattr(learner, 'latest_event_diagnostics', {}) or {}
         parts = []
         for layer_idx, router in enumerate(learner.spike_select):
+            layer_event_diag = latest_event_diagnostics.get(layer_idx, {})
+            temporal_event_diag = layer_event_diag.get("temporal", {})
+            variable_event_diag = layer_event_diag.get("variable", {})
+            fused_event_diag = layer_event_diag.get("fused", {})
+            route_diag = layer_event_diag.get("route", {})
+            quat_diag = layer_event_diag.get("quaternion", {})
             parts.append(
-                "L{} retain_log_scale={:.4f} event_log_scale={:.4f} event_residual_scale={:.4f} membrane_w_norm={:.4f} event_proj_w_norm={:.4f} quat_gate_bias={:.4f} quat_gate_w_norm={:.4f} quat_r_norm={:.4f} quat_i_norm={:.4f} quat_j_norm={:.4f} quat_k_norm={:.4f}".format(
+                "L{} retain_log_scale={:.4f} event_log_scale={:.4f} event_residual_scale={:.4f} membrane_w_norm={:.4f} event_proj_w_norm={:.4f} quat_gate_bias={:.4f} quat_gate_w_norm={:.4f} quat_r_norm={:.4f} quat_i_norm={:.4f} quat_j_norm={:.4f} quat_k_norm={:.4f} retain_mean={:.4f} retain_min={:.4f} retain_std={:.4f} event_mean={:.5f} event_max={:.5f} route_logit_mean={:.4f} route_logit_std={:.4f} selection_mean={:.4f} selection_std={:.4f} selection_factor_mean={:.4f} selection_factor_std={:.4f} temporal_density_mean={:.4f} variable_density_mean={:.4f} temporal_ratio_mean={:.4f} variable_ratio_mean={:.4f} fused_clip={:.4f} fused_ratio_mean={:.4f} fused_cap_mean={:.4f} quat_alpha_mean={:.4f} quat_alpha_max={:.4f} quat_raw_ratio_mean={:.4f} quat_bound_ratio_mean={:.4f} quat_bound_ratio_max={:.4f} quat_clip={:.4f}".format(
                     layer_idx,
                     router.retain_log_scale.detach().item(),
                     router.event_log_scale.detach().item(),
@@ -137,6 +180,30 @@ class Exp_Main(Exp_Basic):
                     learner.quat_h2n[layer_idx].i.detach().norm().item(),
                     learner.quat_h2n[layer_idx].j.detach().norm().item(),
                     learner.quat_h2n[layer_idx].k.detach().norm().item(),
+                    route_diag.get("retain_mean", float('nan')),
+                    route_diag.get("retain_min", float('nan')),
+                    route_diag.get("retain_std", float('nan')),
+                    route_diag.get("event_mean", float('nan')),
+                    route_diag.get("event_max", float('nan')),
+                    route_diag.get("route_logit_mean", float('nan')),
+                    route_diag.get("route_logit_std", float('nan')),
+                    route_diag.get("selection_mean", float('nan')),
+                    route_diag.get("selection_std", float('nan')),
+                    route_diag.get("selection_factor_mean", float('nan')),
+                    route_diag.get("selection_factor_std", float('nan')),
+                    route_diag.get("temporal_density_mean", float('nan')),
+                    route_diag.get("variable_density_mean", float('nan')),
+                    temporal_event_diag.get("coupled_residual_ratio_mean", float('nan')),
+                    variable_event_diag.get("coupled_residual_ratio_mean", float('nan')),
+                    fused_event_diag.get("clip_rate", float('nan')),
+                    fused_event_diag.get("coupled_residual_ratio_mean", float('nan')),
+                    fused_event_diag.get("adaptive_ratio_max_mean", float('nan')),
+                    quat_diag.get("alpha_mean", float('nan')),
+                    quat_diag.get("alpha_max", float('nan')),
+                    quat_diag.get("raw_residual_ratio_mean", float('nan')),
+                    quat_diag.get("bounded_residual_ratio_mean", float('nan')),
+                    quat_diag.get("bounded_residual_ratio_max", float('nan')),
+                    quat_diag.get("clip_rate", float('nan')),
                 )
             )
 
@@ -189,7 +256,13 @@ class Exp_Main(Exp_Basic):
                 )
             )
 
-        logger.info(f"[QSHDiag][stage={train_stage}][epoch={epoch}] " + " | ".join(parts))
+        grad_diag = getattr(self, "_latest_qsh_grad_diag", {}) or {}
+        grad_parts = [f"{name}={value:.4e}" for name, value in sorted(grad_diag.items())]
+        prefix = (
+            f"[QSHDiag][itr={self.configs.itr_i}][stage={train_stage}][epoch={epoch}] "
+            f"train_loss={train_loss_mean:.6f} vali_loss={vali_loss:.6f} lr={lr:.6e}"
+        )
+        logger.info(prefix + " | " + " | ".join(parts + grad_parts))
 
     def _get_state_dict(self, path: Path) -> OrderedDict:
         '''
@@ -397,6 +470,7 @@ class Exp_Main(Exp_Basic):
                             loss.backward(retain_graph=self.configs.retain_graph)
                         else:
                             accelerator.backward(loss, retain_graph=self.configs.retain_graph)
+                        self._latest_qsh_grad_diag = self._collect_qsh_gradient_diagnostics(model_train)
                         if self.configs.task_name == "classification":
                             clip_grad_norm_(model_train.parameters(), max_norm=4.0)
                         model_optim.step()
@@ -412,6 +486,7 @@ class Exp_Main(Exp_Basic):
                 #     accelerator.save_state(safe_serialization=False)
 
                 # validation
+                vali_loss = float('nan')
                 if epoch % self.configs.val_interval == 0:
                     vali_loss = self.vali(
                         model_train=model_train, 
@@ -435,7 +510,15 @@ class Exp_Main(Exp_Basic):
                         "loss_train": np.mean(train_loss),
                     })
 
-                self._log_qsh_diagnostics(model_train, epoch, train_stage)
+                train_loss_mean = float(np.mean(train_loss)) if train_loss else float('nan')
+                self._log_qsh_diagnostics(
+                    model_train,
+                    epoch,
+                    train_stage,
+                    train_loss_mean=train_loss_mean,
+                    vali_loss=float(vali_loss),
+                    lr=lr_scheduler.get_last_lr()[0],
+                )
                 lr_scheduler.step()
                 logger.debug(f'Updating learning rate to {lr_scheduler.get_last_lr()[0]:.6e}')
                 if accelerator.check_trigger():

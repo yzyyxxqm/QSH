@@ -1,6 +1,6 @@
 # QSH-Net 当前总览
 
-> **最后更新：** 2026-04-18
+> **最后更新：** 2026-04-19
 > **用途：** 一页式入口文档。用于快速回答“当前模型是什么、当前保留哪版、当前效果怎样、下一步从哪里继续”。
 
 ## 1. 一句话结论
@@ -26,12 +26,14 @@
 
 当前工作区保留版本：
 
-- `eventdensvar_main`
+- `variable residual only + adaptive fused-cap`
 
-它相对于统一主线母体 `eventscalecap_main` 的差异只有一个：
+它是在 `eventdensvar_main` 之后继续收缩得到的当前代码主线，核心差异是：
 
 - temporal 路径保持不变
-- 只在 variable 路径上引入 route-density aware 的温和 `event_scale` 衰减
+- event 注入的直接调制仍只保留在 variable 路径上
+- fused context 阶段只约束 variable residual
+- fused residual 上界会根据 route density 与 residual pressure 自适应收紧
 
 对应代码位置：
 
@@ -84,13 +86,13 @@
 
 ### 4.2 当前工作区保留候选
 
-- `eventdensvar_main`
+- `variable residual only + adaptive fused-cap`
 
 定位：
 
 - 不是新的统一主线
-- 但已经达到“结果可接受、值得保留”的状态
-- 若后续继续做 `event density` 方向，应以它为直接起点
+- 但 USHCN `itr=5 = 0.16785 ± 0.00772` 已达到可接受状态
+- 当前所有继续压 USHCN 坏轮的结构试验都应以它为直接起点
 
 ### 4.3 最保守稳定版本
 
@@ -120,14 +122,22 @@
 
 | 版本 | 数据集 | 轮数 | MSE 均值 ± std |
 |------|--------|------|----------------|
+| `variable residual only + adaptive fused-cap` | USHCN | 5 | `0.16785 ± 0.00772` |
+| `variable residual only + adaptive fused-cap` | USHCN | 10 | `0.19035 ± 0.03078` |
 | `eventdensvar_main` | HumanActivity | 3 | `0.04181 ± 0.00011` |
 | `eventdensvar_main` | USHCN | 5 | `0.1703 ± 0.0058` |
+| `eventdensvar_main` | HumanActivity | 5 | `0.04174 ± 0.00019` |
+| `eventdensvar_main` | USHCN | 10 | `0.1886 ± 0.0324` |
+| `eventdensvar_main` | P12 | 5 | `0.30092 ± 0.00062` |
+| `eventdensvar_main` | MIMIC_III | 5 | `0.39791 ± 0.01530` |
 
 解读：
 
-- `HumanActivity` 改善被完整保住
-- `USHCN` 相比 `eventscalecap_main` 略差
-- 但比同轮的其他 density 试验版本明显更好，而且方差收敛得更像“可接受版本”
+- 本地与服务器都确认 `HumanActivity` 改善被完整保住
+- `P12` 在服务器上表现稳定
+- `MIMIC_III` 均值可接受，但仍有单轮失稳
+- `USHCN` 在服务器 `itr=10` 下坏轮仍明显，因此当前版本不能升级为统一主线
+- 它仍然比同轮的其他 density 试验版本更可接受，因此保留为工作区候选仍然合理
 
 ### 5.3 已经明确否决的近邻版本
 
@@ -135,6 +145,11 @@
 |------|---------------|-------|------|
 | `eventrescap_main` | `0.04185 ± 0.00009` | `0.1834 ± 0.0273` | 全局 residual 比例硬约束失败 |
 | `eventdenscap_main` | `0.04181 ± 0.00011` | `0.1891 ± 0.0347` | temporal + variable 全路径 density 抑制失败 |
+| `routebound075` | 未跑 | `0.18132 ± 0.02602` | 单纯压 route logit 失败 |
+| `eventprojgrad2` | 未跑 | `0.18962 ± 0.03279` | 单纯加速 event projection 学习失败 |
+| `routeconfvar` | 未跑 | `0.19155 ± 0.03720` | route dispersion 感知 event 衰减失败 |
+| `memgradclip012` | 未跑 | `0.17775 ± 0.02485` | 直接裁剪 membrane 梯度失败 |
+| `routecenter` | 未跑 | `0.18433 ± 0.03669` | route 均值中心化失败 |
 
 这两条结果说明：
 
@@ -160,8 +175,17 @@
 如果下一步继续做架构优化，默认遵守下面三条：
 
 1. 主线对照仍用 `eventscalecap_main / eventscalecap_itr10`
-2. `event density` 方向从 `eventdensvar_main` 接着做
+2. 当前代码实验从 `variable residual only + adaptive fused-cap` 接着做
 3. 不再回到 `eventrescap_main` 或 `eventdenscap_main`
+4. 不再默认继续做 route bound、event projection 梯度放大或 route dispersion 触发的 event 衰减
+5. 不再默认继续做 `membrane_proj` 单点梯度裁剪或梯度倍率
+6. 不再默认继续做 route logit 均值中心化
+
+补充当前最直接的优化目标：
+
+1. 不再追求进一步改善 `HumanActivity`
+2. 优先压制 `USHCN` 的坏轮
+3. 同时确保 `P12 / MIMIC_III` 不明显退化
 
 ## 8. 详细文档入口
 
