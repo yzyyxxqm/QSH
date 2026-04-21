@@ -1,279 +1,127 @@
 # QSH-Net 服务器验证说明
 
-> **最后更新：** 2026-04-18
+> **最后更新：** 2026-04-21
 > **用途：** 说明当前推荐的服务器验证对象、运行顺序、脚本入口与结果回收方式。
 
 ## 1. 当前推荐验证对象
 
-当前推荐放到服务器上做全数据集验证的版本是：
-
-- `spikeselectprop_res005_itr10`
+当前不推荐立刻把最近这轮 `residual-correction` 近邻版本直接放到服务器做全数据集验证。
 
 原因：
 
-- 它是当前最新的结构候选；
-- `USHCN itr=10 = 0.16988 ± 0.00937`，max `0.19176`，优于 `eventgateconst`；
-- `HumanActivity itr=5 = 0.04175 ± 0.00018`，不伤简单数据；
-- 它比纯 `eventgateconst` 更适合讲「spike-driven residual propagation selection」。
+- 最近连续 3 条单因素都没有在本地 `USHCN` 上通过筛选；
+- 失败版本包括：
+  - `qsh_rescorrnorm100_cap003_selfgate_ushcn_itr5_local`
+  - `qsh_rescorrnorm100_cap003_confgate_ushcn_itr5_local`
+  - `qsh_cap003_budget075_ushcn_itr5_local`
+- 在这种情况下，把它们直接扩展到服务器全数据集验证没有价值。
 
-上一轮服务器验证对象：
+## 2. 最近一轮本地筛选结论
 
-- `eventdensvar_main`
+### 2.1 `selfgate`
 
-已经确认：
+- `USHCN = 0.190852 ± 0.037656`
+- 失败
 
-- `HumanActivity` 与 `P12` 可用；
-- `USHCN` 坏轮明显；
-- 因此不再作为当前默认服务器验证对象。
+### 2.2 `confgate`
 
-如果只是要做当前默认对照，则仍使用：
+- `USHCN = 0.207944 ± 0.039097`
+- 明显失败
 
-- `eventscalecap_main`
-- `eventscalecap_itr10`
+### 2.3 `budget075`
 
-## 2. 当前推荐验证范围
+- `USHCN = 0.194180 ± 0.036793`
+- 失败
 
-服务器验证默认覆盖 4 个数据集：
+当前判断：
 
-| 数据集 | 推荐 `itr` | 目的 |
-|------|------------|------|
-| `HumanActivity` | 5 | 用和其他主数据集一致的重复次数确认改善是否稳固 |
-| `USHCN` | 10 | 重点确认高方差数据集的长重复表现 |
-| `P12` | 5 | 验证医疗类中等规模数据上的迁移效果 |
-| `MIMIC_III` | 5 | 验证大医疗数据集上的泛化效果 |
+- 这 3 个版本都不值得进入服务器全数据集验证名单；
+- 当前服务器验证仍应优先保留已经完成正式回收的历史候选，如 `spikeselectprop_res005`，而不是把这批失败近邻再扩展出去。
 
-当前默认不纳入：
+## 3. 服务器验证的使用原则
 
-| 数据集 | 原因 |
-|------|------|
-| `MIMIC_IV` | 本地与服务器单次运行耗时都较高，当前阶段先不作为首轮验证对象 |
+当前阶段默认遵守：
 
-如果需要单独验证 `MIMIC_IV`，使用独立脚本，不和四数据集并行脚本混跑：
+1. 本地如果只是在 `USHCN` 上压坏轮、但其他数据集没有明确收益，不优先上服务器；
+2. 本地如果只是 `HumanActivity` 有轻微变化，也不上服务器；
+3. `USHCN` 的本地筛选标准改为：
+- `itr=5` 中大部分 seed 优于 `HyperIMTS` 论文/项目参考；
+- 而不是必须先把最坏轮压到很低；
+4. 服务器优先用于：
+- 已通过本地双数据集或至少 `USHCN` 本地筛选的候选；
+- 正式论文候选版本；
+- 多数据集平均表现验证。
 
-```bash
-bash scripts/QSHNet/server_validate_spikeselectprop_res005_mimic_iv.sh
-```
+## 4. 当前服务器正式参考结果
 
-建议先用 1 轮 smoke test 确认服务器数据缓存和维度无误：
+当前可继续引用的正式服务器结果，仍以历史候选为主：
 
-```bash
-ITR_MIMIC_IV=1 bash scripts/QSHNet/server_validate_spikeselectprop_res005_mimic_iv.sh
-```
+### 4.1 `spikeselectprop_res005`
 
-如果显存紧张，可以降低 batch size：
+| 数据集 | 轮数 | QSHNet MSE | 结论 |
+|------|------|------------|------|
+| `USHCN` | 5 主表 / 10 压测 | `0.16750 ± 0.00357` | 当前历史论文候选中的最强结果之一 |
+| `HumanActivity` | 5 | `0.04172 ± 0.00018` | 接近 HyperIMTS 论文/项目参考 |
+| `P12` | 5 | `0.30087 ± 0.00084` | 小幅退化但稳定 |
+| `MIMIC_III` | 5 | `0.39396 ± 0.00308` | 基本持平 |
+| `MIMIC_IV` | 5 | `0.21549 ± 0.00188` | 暂按旧参考值略优 |
 
-```bash
-BATCH_SIZE_MIMIC_IV=16 ITR_MIMIC_IV=1 bash scripts/QSHNet/server_validate_spikeselectprop_res005_mimic_iv.sh
-```
-
-## 3. 脚本入口
-
-### 3.1 全数据集验证脚本
-
-直接运行：
-
-```bash
-bash scripts/QSHNet/server_validate_spikeselectprop_res005_all.sh
-```
-
-这个脚本默认：
-
-- `HumanActivity`: `itr=5`
-- `USHCN`: `itr=10`
-- `P12`: `itr=5`
-- `MIMIC_III`: `itr=5`
-- 四个数据集并行启动
-
-### 3.2 可选环境变量
-
-如果服务器资源或时间窗口不同，可以临时覆盖：
-
-```bash
-USE_MULTI_GPU=1 ITR_USHCN=5 ITR_HUMAN=3 ITR_MIMIC_III=3 bash scripts/QSHNet/server_validate_spikeselectprop_res005_all.sh
-```
-
-支持的环境变量：
-
-- `USE_MULTI_GPU`
-- `ITR_USHCN`
-- `ITR_HUMAN`
-- `ITR_P12`
-- `ITR_MIMIC_III`
-
-### 3.3 服务器启动训练前的维度自检
-
-在正式启动多数据集训练前，建议先执行一次：
-
-```bash
-conda run -n pyomnits python scripts/QSHNet/check_eventdensvar_dims.py
-```
-
-这个脚本会直接对当前 `eventdensvar_main` 做真实 batch 前向检查，覆盖：
-
-- `HumanActivity`
-- `USHCN`
-- `P12`
-- `MIMIC_III`
-
-通过标准不是简单比较配置文件中的 `pred_len`，而是检查：
-
-- 输入变量维度是否匹配 `enc_in`
-- 目标变量维度是否匹配 `c_out`
-- `x / y` 与对应 `mask` 是否同形
-- `x_mark / y_mark` 是否与序列长度一致
-- 模型输出 `pred` 是否与真实目标 `y` 同形
-
-如果该脚本返回 `ALL_OK`，就说明当前服务器环境下至少不存在这四个数据集的基础维度错配问题。
-
-## 4. 结果回收
-
-### 4.1 训练日志
-
-脚本会自动创建日志目录：
-
-```bash
-storage/logs/eventdensvar_main_server_validate_YYYYmmdd_HHMMSS/
-```
-
-其中包括：
-
-- 每个数据集一个独立日志文件
-- `summary.log`
-- `summary.json`
-
-### 4.2 `QSHDiag` 轨迹解析
-
-当前 `QSHNet` 的 epoch 级诊断已经扩展到 route、fused residual、quaternion residual 与核心梯度范数。
-
-如果手动运行训练，建议始终用 `tee` 保存日志：
-
-```bash
-mkdir -p storage/logs/qshdiag
-conda run -n pyomnits python main.py \
-  --is_training 1 \
-  --collate_fn collate_fn \
-  --loss MSE \
-  --d_model 256 \
-  --n_layers 1 \
-  --n_heads 1 \
-  --use_multi_gpu 0 \
-  --dataset_root_path storage/datasets/USHCN \
-  --model_id coupledctxadapt_main \
-  --model_name QSHNet \
-  --dataset_name USHCN \
-  --dataset_id USHCN \
-  --features M \
-  --seq_len 150 \
-  --pred_len 3 \
-  --enc_in 5 \
-  --dec_in 5 \
-  --c_out 5 \
-  --train_epochs 300 \
-  --patience 10 \
-  --val_interval 1 \
-  --itr 10 \
-  --batch_size 16 \
-  --learning_rate 1e-3 \
-  2>&1 | tee storage/logs/qshdiag/ushcn_coupledctxadapt_itr10.log
-```
-
-训练完成后解析 `QSHDiag`：
-
-```bash
-python scripts/QSHNet/extract_qshdiag.py \
-  storage/logs/qshdiag/ushcn_coupledctxadapt_itr10.log \
-  -o storage/logs/qshdiag/ushcn_coupledctxadapt_itr10_qshdiag.csv
-```
-
-判读重点：
-
-1. 先按最终 `metric.json` 将 `itr` 分成好轮与坏轮。
-2. 比较早期 epoch 的 `vali_loss` 是否已经分叉。
-3. 再看 `retain_min / route_logit_std / fused_clip / quat_bound_ratio_max / quat_clip` 是否在坏轮中提前异常。
-4. 最后看梯度范数，尤其是 `L0_membrane_w_grad`、`L0_event_proj_w_grad`、`L0_quat_gate_w_grad` 与 `L0_quat_*_grad`。
-
-### 4.3 汇总脚本
-
-如果中途单独跑了某几个数据集，也可以手动汇总：
-
-```bash
-python scripts/QSHNet/summarize_variant_results.py \
-  --model_name QSHNet \
-  --model_id eventdensvar_main \
-  --datasets HumanActivity,USHCN,P12,MIMIC_III
-```
-
-如需落盘 JSON：
-
-```bash
-python scripts/QSHNet/summarize_variant_results.py \
-  --model_name QSHNet \
-  --model_id eventdensvar_main \
-  --datasets HumanActivity,USHCN,P12,MIMIC_III \
-  --output_json storage/logs/eventdensvar_summary.json
-```
-
-## 5. 本轮服务器验证结果
-
-本轮实际得到的 `eventdensvar_main` 服务器结果如下：
+### 4.2 `eventdensvar_main`
 
 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
 |------|------|----------------|------|
-| `HumanActivity` | 5 | `0.04174 ± 0.00019` | 改善可复现，且稳定 |
-| `USHCN` | 10 | `0.1886 ± 0.0324` | 坏轮明显，未通过统一主线门槛 |
-| `P12` | 5 | `0.30092 ± 0.00062` | 结果稳定，通过 |
+| `HumanActivity` | 5 | `0.04174 ± 0.00019` | 改善可复现 |
+| `USHCN` | 10 | `0.1886 ± 0.0324` | 坏轮明显，不能升级为主线 |
+| `P12` | 5 | `0.30092 ± 0.00062` | 稳定 |
 | `MIMIC_III` | 5 | `0.39791 ± 0.01530` | 均值可接受，但仍有单轮失稳 |
 
-本轮结论：
+## 5. 当前推荐做法
 
-1. `eventdensvar_main` 不能升级为新的统一主线。
-2. 它仍可保留为 `event density` 方向的工作区候选。
-3. 如果后续继续优化，重点应只放在压制 `USHCN` 坏轮，且不能破坏 `HumanActivity / P12`。
+如果后续要再上服务器，建议先满足下面至少一条：
 
-## 6. 当前参考基线
+1. 非 `USHCN` 数据集上已有明确收益，并且 `USHCN itr=5` 主体 seed 仍优于 `HyperIMTS` 论文/项目参考；
+2. 本地至少证明该版本不是单纯“为救 USHCN 坏轮而保守化”的近邻；
+3. 本地 `HumanActivity` 没有出现明显退化；
+4. 结构上属于新的论文候选主线，而不是仅仅一个失败近邻。
 
-服务器结果回来后，默认与下面几组值对比：
+在达到这些条件之前，服务器资源优先留给：
 
-### 6.1 统一主线母体
+- 正式主线的复验；
+- 历史结果补表；
+- 其他数据集的完整对照。
 
-- `eventscalecap_main`
-  - HumanActivity: `0.0430 ± 0.0013`
-  - USHCN: `0.1663 ± 0.0027`
+## 6. 补记：已准备但当前不推荐上服务器的候选
 
-- `eventscalecap_itr10`
-  - USHCN: `0.1728 ± 0.0222`
+### 6.1 `qsh_coredecoder_rescorr_main`
 
-### 6.2 当前工作区保留候选
+这条链已经做过本地筛查：
 
-- `eventdensvar_main`
-  - HumanActivity: `0.04181 ± 0.00011`
-  - USHCN: `0.1703 ± 0.0058`
+- `HumanActivity = 0.041477 ± 0.000186`
+- `USHCN = 0.253231 ± 0.023152`
 
-### 6.3 最保守稳定版本
+结论：
 
-- `retaincap_main`
-  - USHCN: `0.1673 ± 0.0033`
+- 它在 `HumanActivity` 上很好；
+- 但在 `USHCN` 上本地已经明显失败；
+- 因此当前不应再把它写成“默认下一条服务器主线”。
 
-## 7. 当前推荐判读方式
+对应脚本仍可作为历史草稿保留：
 
-1. 先看 `HumanActivity` 是否继续保持在 `0.0418` 量级附近。
-2. 再看 `USHCN itr=10` 是否仍维持比 `eventnorm_itr10` 更稳的长重复表现。
-3. 然后看 `P12 / MIMIC_III` 是否出现明显退化。
-4. 最后再决定：
-   - `eventdensvar_main` 是否值得升级成新的跨数据集候选
-   - 或者仍只保留为 `event density` 方向的工作区保留候选
+- [server_validate_coredecoder_rescorr_all.sh](/opt/Codes/PyOmniTS/scripts/QSHNet/server_validate_coredecoder_rescorr_all.sh)
+- [server_validate_coredecoder_rescorr_mimic_iv.sh](/opt/Codes/PyOmniTS/scripts/QSHNet/server_validate_coredecoder_rescorr_mimic_iv.sh)
 
-按本轮实际结果，应使用更明确的判读口径：
+### 6.2 如果后续还要新增服务器候选，优先看什么
 
-1. `HumanActivity` 已通过。
-2. `P12` 已通过。
-3. `MIMIC_III` 基本可接受，但还不是完全稳定版本。
-4. `USHCN` 未通过，因此当前版本不能升级为统一主线。
+从当前已经补回的本地结果看，更接近服务器候选门槛的是：
 
-## 8. 相关文档
+1. `spikeselectprop_adapt025_qbias4_local`
+- `HumanActivity = 0.041735 ± 0.000144`
+- `USHCN = 0.164609 ± 0.002637`
 
-- [QSHNet_overview.md](/opt/Codes/PyOmniTS/docs/QSHNet_overview.md)
-- [QSHNet_naming_conventions.md](/opt/Codes/PyOmniTS/docs/QSHNet_naming_conventions.md)
-- [QSHNet_results_summary.md](/opt/Codes/PyOmniTS/docs/QSHNet_results_summary.md)
-- [QSHNet_data_audit.md](/opt/Codes/PyOmniTS/docs/QSHNet_data_audit.md)
-- [QSHNet_architecture_status.md](/opt/Codes/PyOmniTS/docs/QSHNet_architecture_status.md)
+2. `qsh_routebudget_floor025_ushcn_local`
+- `USHCN = 0.169866 ± 0.014330`
+
+但它们仍缺：
+
+- `P12 / MIMIC_III / MIMIC_IV` 的本地或服务器多数据集回收；
+- 更完整的正式候选叙事整理。

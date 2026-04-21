@@ -59,10 +59,7 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self, model: Module) -> optim.Optimizer:
-        if 'QSH' in self.configs.model_name:
-            model_optim = optim.AdamW(model.parameters(), lr=self.configs.learning_rate, weight_decay=1e-4)
-        else:
-            model_optim = optim.Adam(model.parameters(), lr=self.configs.learning_rate)
+        model_optim = optim.Adam(model.parameters(), lr=self.configs.learning_rate)
         return model_optim
 
     def _select_lr_scheduler(self, optimizer: optim.Optimizer) -> LRScheduler:

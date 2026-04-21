@@ -9,6 +9,7 @@ notes.md
 pytorch.bin
 *.code-workspace
 
+PyOmniTS/
 storage/
 log/
 logs/
