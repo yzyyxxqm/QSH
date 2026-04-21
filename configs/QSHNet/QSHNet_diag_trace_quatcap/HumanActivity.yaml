@@ -35,7 +35,7 @@ hidden_layers: 1
 individual: 0
 informer_distil: 1
 is_training: 1
-itr: 1
+itr: 5
 itr_i: 0
 kernel_size: 25
 label_len: 0

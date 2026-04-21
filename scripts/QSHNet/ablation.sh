@@ -10,9 +10,9 @@
 #   F: CausalMask only (noQB_noQH_noSP) — HyperIMTS + causal temporal masking
 #
 # Usage:
-#   bash scripts/QSHNet/ablation.sh                 # all configs × 3 datasets, itr=1
-#   bash scripts/QSHNet/ablation.sh E               # only config E, itr=1
-#   bash scripts/QSHNet/ablation.sh E USHCN         # only config E on USHCN, itr=1
+#   bash scripts/QSHNet/ablation.sh                 # all configs × 3 datasets, itr=5
+#   bash scripts/QSHNet/ablation.sh E               # only config E, itr=5
+#   bash scripts/QSHNet/ablation.sh E USHCN         # only config E on USHCN, itr=5
 #   bash scripts/QSHNet/ablation.sh E "" 5          # config E, all datasets, itr=5
 #   bash scripts/QSHNet/ablation.sh F "" 5          # config F, all datasets, itr=5
 
@@ -21,7 +21,7 @@
 model_name="QSHNet"
 FILTER_CONFIG="${1:-}"
 FILTER_DATASET="${2:-}"
-ITR="${3:-1}"
+ITR="${3:-5}"
 
 run_one() {
     local ablation_name="$1"

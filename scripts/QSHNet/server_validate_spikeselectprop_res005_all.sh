@@ -2,7 +2,7 @@
 # =============================================================================
 # QSH-Net spikeselectprop_res005_itr10 全数据集服务器验证脚本
 # 默认按当前约定运行：
-# - USHCN: itr=10
+# - USHCN: itr=5
 # - HumanActivity: itr=5
 # - P12 / MIMIC_III: itr=5
 # - 默认并行启动 HumanActivity / USHCN / P12 / MIMIC_III
@@ -34,7 +34,7 @@ fi
 MODEL_NAME="QSHNet"
 MODEL_ID="spikeselectprop_res005_itr10"
 
-ITR_USHCN="${ITR_USHCN:-10}"
+ITR_USHCN="${ITR_USHCN:-5}"
 ITR_HUMAN="${ITR_HUMAN:-5}"
 ITR_P12="${ITR_P12:-5}"
 ITR_MIMIC_III="${ITR_MIMIC_III:-5}"

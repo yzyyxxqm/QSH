@@ -95,7 +95,7 @@ def build_configs(spec: dict) -> object:
         "--n_heads", str(spec["n_heads"]),
         "--batch_size", str(spec["batch_size"]),
         "--num_workers", "0",
-        "--itr", "1",
+        "--itr", "5",
     ]
     return get_configs(args=args)
 

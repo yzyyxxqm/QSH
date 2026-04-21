@@ -14,8 +14,9 @@ storage/
 log/
 logs/
 wandb/
-test*.py
-test*.ipynb
+# Only ignore ad-hoc test files placed at repo root.
+/test*.py
+/test*.ipynb
 !tests/**
 *.npy
 *.csv
